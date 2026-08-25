@@ -90,6 +90,29 @@ when they do, calls fail with `ExpiredToken`, and the session token must be
 refreshed from the classroom and re-applied with
 `aws configure set aws_session_token`. Adding credentials is always Mark's action.
 
+**CodeBuild is dead in the lab account -- do not re-diagnose this.**
+`agentcore deploy` fails every time with CodeBuild status `STOPPED` 1-4 seconds
+into `PROVISIONING`, no context message, zero bytes of build log. Confirmed three
+times across separate projects with freshly created roles, so it is nothing to do
+with the agent code, the Dockerfile or IAM. Cause: the account carries an
+EventBridge rule `voc-codebuild-cw-rule` matching
+`{"source":["aws.codebuild"],"detail-type":["CodeBuild Build State Change"]}`,
+one of a family of `voc-*` cost-control rules also watching EC2, RDS and Redshift.
+Its targets cannot be read -- `events:ListTargetsByRule` is an **explicit deny** in
+Vocareum's SCP `p-3zsdtilq` from org master `401209005059` -- so the policing
+mechanism is deliberately hidden. `cloudtrail:LookupEvents` is also unavailable.
+Unfixable from inside; escalate to Udacity if a working container deploy is needed.
+
+Routes that do work, or are still untested:
+
+| Route | State |
+| --- | --- |
+| `agentcore dev` | **Works**, once `pip install uv` is done -- `uv` is the missing dependency, not Docker. Uvicorn on `0.0.0.0:8080` |
+| `python <entrypoint>.py` then curl `localhost:8080` | Works, needs nothing but the deps |
+| `agentcore deploy` (CodeBuild) | Permanently blocked, see above |
+| `agentcore deploy --local-build` | Impossible in the lab: no container engine, and the VM is `linux/amd64` while Runtime needs `linux/arm64` |
+| Direct Code Deploy (zip to S3, no CodeBuild) | **Untested.** Only offered when `uv` is present, which it now is. Needs a re-run of `agentcore configure` to switch off container mode. The most promising remaining path |
+
 **Mark's personal account** -- reachable only from a session on his own machine
 through `~/.aws-personal/`. His own money, so state the cost and get confirmation
 before creating any billable resource, and record every long-lived resource in
@@ -99,7 +122,7 @@ section 5 so a later session knows to tear it down.
 
 | Resource | Region | Created | Standing cost | Torn down? |
 | --- | --- | --- | --- | --- |
-| WanderBot deploy scaffolding in **Vocareum account 484086766087**: ECR repo `bedrock-agentcore-wanderbot`, S3 bucket `bedrock-agentcore-codebuild-sources-484086766087-us-east-1`, IAM roles `AmazonBedrockAgentCoreSDKRuntime-us-east-1-a25b0cb827` and `...CodeBuild-us-east-1-a25b0cb827`, CodeBuild project `bedrock-agentcore-wanderbot-builder` | us-east-1 | 2026-08-24 | None to Mark -- lab account pays, and it goes when the lab does | n/a |
+| Deploy scaffolding in **Vocareum account 484086766087** for agents `WanderBot` and `Solu`: 2 ECR repos `bedrock-agentcore-<agent>`, 2 CodeBuild projects `bedrock-agentcore-<agent>-builder`, 4 IAM roles `AmazonBedrockAgentCoreSDK{Runtime,CodeBuild}-us-east-1-<hash>`, S3 bucket `bedrock-agentcore-codebuild-sources-<account>-<region>`, 2 CodeBuild log groups. No agent runtime was ever created, since every build was stopped. Each `agentcore deploy` from a new directory mints another full set | us-east-1 | 2026-08-24 | None to Mark -- lab account paid | **Yes, 2026-08-25.** All 11 deleted and verified empty. Note: `.bedrock_agentcore.yaml` in the VM still names the deleted ECR repo and role ARNs, so the next `agentcore deploy` there will reuse dead references instead of recreating -- re-run `agentcore configure` first |
 
 ## 6. Status
 

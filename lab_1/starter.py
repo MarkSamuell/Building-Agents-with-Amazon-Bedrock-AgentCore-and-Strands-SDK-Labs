@@ -1,25 +1,26 @@
 """
 ================================================================================
-WanderBot — EXERCISE: Strands SDK + AgentCore Runtime
+WanderBot — EXERCISE SOLUTION: Strands SDK + AgentCore Runtime
 ================================================================================
-Your first WanderBot. Wire up a Strands Agent with the built-in calculator
-tool inside a BedrockAgentCoreApp, then deploy it to AgentCore Runtime.
+Reference solution for the exercise. A Strands Agent with the built-in
+calculator tool, wrapped in a BedrockAgentCoreApp, ready for AgentCore Runtime.
 
-STEPS
------
-  Step 1: Import BedrockAgentCoreApp, Agent, BedrockModel, calculator
-  Step 2: Create the BedrockAgentCoreApp instance
-  Step 3: Configure BedrockModel with MODEL_ID
-  Step 4: Write a SYSTEM_PROMPT that defines WanderBot's persona
-  Step 5: Inside invoke(), build an Agent(model, system_prompt, tools=[calculator])
-          and return agent(user_message)
+HOW TO RUN
+----------
+  agentcore configure
+  agentcore dev
+  agentcore invoke --dev '{"message": "A round-trip flight costs $349. Hotel is $175/night for 4 nights. Total?"}'
+
+  agentcore deploy --auto-update-on-conflict
+  agentcore invoke '{"message": "How do I contact Horizon Travel customer support?"}'
+================================================================================
 """
 
 import logging
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands import Agent 
-from strands.models import BedrockModel 
+from strands import Agent
+from strands.models import BedrockModel
 from strands_tools import calculator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -71,7 +72,8 @@ async def invoke(payload: dict, context=None):
         system_prompt=SYSTEM_PROMPT,
         tools=[calculator],
     )
-    return agent(user_message)
+    response = agent(user_message)
+    return response
 
 
 # ---------------------------------------------------------------------------
