@@ -60,7 +60,9 @@ A plain function, plus the schema the model reads to decide whether it wants it.
 
 ## Why is the first tool always a calculator?
 
-Not because arithmetic is interesting. Because LLMs _tokenize digits_, so multi-digit arithmetic is genuinely unreliable in a way that is easy to see and impossible to argue with. It is the cheapest possible demonstration where the failure is visible before the import and gone after it. The lesson is tool-use; the arithmetic is a prop.
+Not because arithmetic is interesting. Because multi-digit arithmetic is genuinely unreliable for a language model, in a way that is easy to see and impossible to argue with. It is the cheapest possible demonstration where the failure is visible before the import and gone after it. The lesson is tool-use; the arithmetic is a prop.
+
+**Why it is unreliable is worth getting right, because the popular explanation is wrong.** Digit tokenization usually takes the blame, but the research finds the limitation persists _regardless of tokenization scheme_: models learn arithmetic as a hierarchy of symbol-to-symbol mappings rather than as an algorithm, and lean on heuristics such as a one-digit lookahead that collapse once carries cascade. The failure is architectural, not a quirk of the tokenizer — which is why a larger model does not reliably fix it and a calculator does.
 
 ## The minimal agent
 
@@ -107,7 +109,9 @@ The agent from the previous topic works, but nothing can _call_ it. It is a scri
 | Endpoint | Method | What it must do |
 | --- | --- | --- |
 | **`/invocations`** | POST | Receive the caller's JSON body, return JSON or an SSE stream |
-| **`/ping`** | GET | Report `{"status": "Healthy"}`, or `HealthyBusy` while background work is still running, which keeps the session alive |
+| **`/ping`** | GET | Report `{"status": "Healthy"}`, or `HealthyBusy` while background work is still running |
+
+A session reporting `Healthy` is treated as idle and **terminated after 15 minutes of inactivity**; one reporting `HealthyBusy` is kept alive past that. `BedrockAgentCoreApp` answers the ping for you, which is why you never see this until you write a long-running tool.
 
 `BedrockAgentCoreApp` implements both routes, the health reporting and the response framing. You never write them yourself — which is the whole point of the wrapper, and why it is _four lines_ rather than a web framework.
 
@@ -133,8 +137,9 @@ app = BedrockAgentCoreApp()
 # 3. THE MODEL, built once at import time
 # Module level on purpose: the adapter holds no conversation, so there is
 # no reason to rebuild it per request.
-# nova-2-lite is chosen for being fast, cheap and strong at tool use -- the
-# three things that matter for an agent, where the model is called repeatedly.
+# nova-2-lite is the course's choice, on the grounds that it is fast, cheap
+# and strong at tool use -- unverified, but the shape of the argument is right:
+# an agent calls the model repeatedly, so per-call latency and price compound.
 MODEL_ID = "us.amazon.nova-2-lite-v1:0"    # the "us." prefix matters -- see below
 model = BedrockModel(
     model_id=MODEL_ID,
@@ -227,6 +232,32 @@ Following one request through, with the ownership boundary marked:
 
 **Why `agent(user_message)` reads like calling a variable** Because a Strands `Agent` implements `__call__`, which makes the instance callable like a function. `agent(user_message)` runs the entire agent loop and returns its result — the same idiom as `model(x)` in PyTorch.
 
+## Deployed fine, but every request says "no handler was found". Why?
+
+The scenario: the agent deploys, `agentcore invoke` returns _no handler was found for the request_, the `invoke` function is definitely present, and the file runs locally without complaint. **Cause: `invoke` is missing its `@app.entrypoint` decorator.**
+
+The clue that looks exculpatory is the one that convicts. _"The file runs locally"_ is not evidence against this bug — it is its fingerprint. Without the decorator everything succeeds right up until a request arrives: the module imports, because Python has no opinion about whether a function is decorated; `BedrockAgentCoreApp()` constructs; `app.run()` starts the server; `/ping` answers `Healthy`. You can watch it boot and see nothing wrong.
+
+Only the bookkeeping is missing. Since `@app.entrypoint` is just `invoke = app.entrypoint(invoke)`, skipping it leaves `app`'s registry _empty_ — a healthy server, listening, with nothing bound to `/invocations`.
+
+The reason it survives every check you would naturally run: **nothing in your own file calls `invoke`, so nothing in your own file notices it was never registered.** The decorator matters only for the code path you did not write. Import it, lint it, read it, start it — all clean. Only a real HTTP request exposes it.
+
+Each rival explanation is ruled out because it would produce a _different_ symptom:
+
+| Cause | What it would actually look like |
+| --- | --- |
+| **Missing `@app.entrypoint`** | `no handler was found` — server healthy, registry empty |
+| Wrong payload key | A reply, just the wrong one: the `payload.get` default |
+| No Bedrock model access, or bad IAM | `AccessDenied`, raised *after* the handler ran |
+| Import missing from `requirements.txt` | Container never starts, so `/ping` fails too |
+| No `app.run()` | Nothing listening at all — connection refused |
+
+So _"no handler"_ is specifically a **routing** failure, which proves the app started cleanly: imports fine, dependencies fine, contract endpoints alive, only the binding absent.
+
+The diagnostic that follows is one step: **curl `/ping` first.** A healthy ping with a failing `/invocations` narrows it to registration immediately. A dead ping sends you to startup and dependencies instead.
+
+> **Note:** one other cause produces the identical symptom — `.bedrock_agentcore.yaml` naming a different entry file than the one you decorated. Same empty registry, different reason, so check which file the config actually points at before rereading your decorators.
+
 > **Note:** the entrypoint is declared `async def`, but `agent(user_message)` is an ordinary blocking call, so nothing here is actually concurrent — the coroutine holds the event loop until the agent finishes. It works and costs nothing for one request at a time. Real streaming needs `agent.stream_async(...)` with `yield` instead.
 
 ## Who decides that the payload key is `message`?
@@ -239,20 +270,26 @@ You do. The documentation is explicit that AgentCore _"passes request payloads d
 
 For _isolation_, and it is the most consequential line in the file. A Strands `Agent` accumulates conversation in `agent.messages`, so a module-level agent would keep every exchange the container ever handled — and traveller B would see traveller A's conversation. Rebuilding per request guarantees each caller starts clean. `model` can stay at module level precisely because it holds no conversation.
 
-The cost is that **WanderBot has no memory at all**. Every request starts from an empty history, so a follow-up like "and what about 5 nights?" arrives with nothing to refer back to. Multi-turn conversation has to be added deliberately later, either by wiring in AgentCore Memory or by rehydrating history from the payload.
+The cost is that **WanderBot has no memory at all**. Every request starts from an empty history, so a follow-up like "and what about 5 nights?" arrives with nothing to refer back to. Multi-turn conversation has to be added deliberately, and there are three routes: Strands' own **session management**, which persists conversation through a pluggable backend and ships with filesystem and S3 implementations; **AgentCore Memory**, the platform's managed store; or rehydrating history from the payload yourself on every call.
 
 ## The model id is not a model id
 
-`us.amazon.nova-2-lite-v1:0` is a _cross-region inference profile_, not a foundation model. The `us.` prefix tells Bedrock it may route the request to whichever US region has capacity.
+`us.amazon.nova-2-lite-v1:0` is a _cross-region inference profile_, not a foundation model. The underlying model is `amazon.nova-2-lite-v1:0`; the prefix selects a routing geography, and the same model publishes `us.`, `eu.` and `jp.` geographic profiles plus a `global.` one that may route to any commercial region.
 
-This has a consequence that only surfaces at deployment: the execution role must allow `bedrock:InvokeModel` on **both** ARNs below, and the foundation-model ARN has an _empty account segment_, because foundation models are not account-scoped.
+Two consequences surface only at deployment.
+
+**The execution role needs two ARN forms and two actions.**
 
 ```
 arn:aws:bedrock:*:<account>:inference-profile/us.amazon.nova-2-lite-v1:0
 arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0
 ```
 
-Granting only the profile ARN produces an authorization failure that names nothing useful, and looks at first glance as though the model does not exist.
+The inference-profile ARN _includes_ the account id. The foundation-model ARN has an **empty account segment** (`::`) because foundation models are not account-scoped — putting an account id there produces an ARN that can never match, so every call fails. Both statements need `bedrock:InvokeModel` **and `bedrock:InvokeModelWithResponseStream`**: the second is not optional here, because Strands invokes through the streaming API even when your code looks synchronous. Granting only the non-streaming action is a common way to get a puzzling `AccessDenied` from working-looking code.
+
+**Model access must be enabled in every destination region, not just yours.** A geographic profile dispatches across the regions in its geography, and the underlying model has to be enabled in each of them. Enabling access in your source region alone leaves the profile free to route to a region where you have none.
+
+Granting only the profile ARN produces an authorization failure that names nothing useful, and reads at first glance as though the model does not exist.
 
 # How Does the Agent Get to Runtime?
 
@@ -288,6 +325,40 @@ The configure menu offers two deployment types, and the difference is worth know
 | Steps | Dockerfile → build → push to ECR → deploy | package → upload → deploy |
 | Iteration speed | slower; every change is a rebuild | faster, which is the point of it |
 | Suits | custom system dependencies, existing container pipelines | rapid prototyping |
+
+## What `agentcore dev` actually runs
+
+A local server on port 8080 speaking the same contract as Runtime, with hot reload. Its startup output says exactly what it is:
+
+| Observed at startup | What it means |
+| --- | --- |
+| `Uvicorn running on http://0.0.0.0:8080` | a plain ASGI server in your own process |
+| `Started reloader process using StatReload` | it watches file timestamps and restarts on change |
+| `Will watch for changes in these directories: [...]` | the watched root is your source directory |
+| `Found credentials in shared credentials file` | it uses your ordinary AWS credentials |
+| refuses to start without `uv` | `[Errno 2] No such file or directory: 'uv'` |
+
+**It does not run a container, despite course material saying it does.** The proof is local: `dev` runs happily in an environment that reports `No container engine found (Docker/Finch/Podman not installed)`, and the reloader watches the host filesystem directly. So it is the same _application_ and the same _HTTP contract_ as production, but _not_ the same execution environment — which means it cannot catch container-only faults: an import missing from `requirements.txt`, an arm64 incompatibility, or a broken Dockerfile.
+
+_Why it needs `uv` is unverified._ The only observable fact is that it refuses to start without it.
+
+## Iterating on the system prompt cheaply
+
+**The constraint first: a prompt's effect cannot be observed without calling the model.** There is no offline check that tells you whether a rewording made tool selection more reliable or the tone warmer. Anything promising prompt iteration "for free" is measuring something else. What you can do is make each iteration nearly instant and nearly free.
+
+**Hot reload removes the restart.** Edit `SYSTEM_PROMPT`, save, and StatReload restarts the app in place; the next `agentcore invoke --dev` uses the new wording. No `configure`, no rebuild, no redeploy. Iterating against a _deployed_ runtime instead means a full container build per word changed.
+
+**In the course lab the calls are not yours to pay for.** The VM authenticates into Vocareum's account, so Bedrock charges land on their budget. Inference only becomes your cost when you point at your own account.
+
+**When it is your account, the lever is token count.** Bedrock bills per token in and per token out. `nova-2-lite` is already at the cheap end, and `max_tokens` caps the expensive half. A prompt-tuning loop with capped output runs at fractions of a cent per iteration.
+
+**Move the checks that don't need the model off the model path.** They cost nothing and catch the mistakes that would otherwise waste inference calls:
+
+``` Python
+print(repr(SYSTEM_PROMPT))   # repr, not print -- the quoting is the point
+```
+
+> **Note:** a triple-quoted prompt written at an indent carries leading spaces on _every line_ into _every request_, plus a leading newline. Behaviourally harmless, billable on each call, and invisible unless you use `repr()`.
 
 ## What `agentcore deploy` actually does
 
