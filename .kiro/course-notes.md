@@ -2,15 +2,15 @@
 
 # Why an Agent Framework?
 
-A foundation model does exactly one thing: text in, text out. It cannot look anything up, cannot reliably do arithmetic, and cannot act on the world. Everything interesting that an "AI agent" appears to do comes from code _around_ the model, not from the model itself.
+A foundation model does one thing: it takes a prompt and returns a completion. It cannot look anything up, cannot reliably do arithmetic, and cannot act on the world. Modern models accept more than text — Nova 2 Lite takes image and video input too — but the shape is unchanged: something goes in, text comes out, and nothing happens. Everything interesting that an "AI agent" appears to do comes from code _around_ the model, not from the model itself.
 
-**The manual alternative** Without a framework you write that surrounding code yourself, and it is always the same code: describe your functions to the model in the prompt, parse the reply to work out _which_ function it wants and with what arguments, validate those arguments, call the function, format the result, append it to the conversation, and call the model again — repeating until the model stops asking. The loop is mechanical, and it fails silently in exactly the places that matter, such as a schema the model misreads or a tool result appended in the wrong shape.
+**The manual alternative** Without a framework you write that surrounding code yourself, and it is always the same code: describe your functions to the model, read the reply to work out _which_ function it wants and with what arguments, validate those arguments, call the function, format the result, append it to the conversation, and call the model again — repeating until the model stops asking. The loop is mechanical, and it fails silently in exactly the places that matter, such as a schema the model misreads or a tool result appended in the wrong shape.
 
 **What Strands supplies** The loop itself, tool schemas generated automatically from your Python function signatures and docstrings, conversation state across turns, and adapters so the same agent runs against a different model provider unchanged.
 
 ## Why not just write the loop myself?
 
-You can — it is perhaps eighty lines. The reason not to is that _the loop is not where the difficulty lives_. The difficulty is in tool-schema generation that the model actually understands, streaming partial responses, retries when a tool throws, capping runaway tool-calling, and keeping conversation state correct when a tool result arrives out of order. A framework is worth it for the second-order concerns, not the first-order one.
+You can, and the happy path is short. The reason not to is that _the loop is not where the difficulty lives_. The difficulty is in tool-schema generation that the model actually understands, streaming partial responses, retries when a tool throws, capping runaway tool-calling, and keeping conversation state correct when a tool result arrives out of order. A framework is worth it for the second-order concerns, not the first-order one.
 
 # The Three Layers
 
@@ -18,11 +18,13 @@ The course introduction names Bedrock, Strands and AgentCore Runtime in one sent
 
 | Layer | What it is | Alone, without the others |
 | --- | --- | --- |
-| **Amazon Bedrock** | An inference API. Messages in, text out. _Stateless_ — no tools, no loop, no memory. | Perfectly usable on its own via `Converse` or `InvokeModel`. |
+| **Amazon Bedrock** | An inference API. Messages in, completion out, _stateless_. It does accept tool specifications and can reply _asking_ for one — but it never executes anything and never loops. | Perfectly usable on its own via `Converse` or `InvokeModel`. |
 | **Strands Agents SDK** | A library running _inside your own process_ that drives the agent loop and the tool plumbing. | A local Python script is already a complete, working agent. Needs no AWS hosting at all. |
-| **AgentCore Runtime** | _Managed hosting_ for an agent — an HTTPS endpoint, session isolation, identity, observability. | Framework-agnostic. Hosts LangGraph, CrewAI or plain Python just as happily as Strands. |
+| **AgentCore Runtime** | _Managed hosting_ — an HTTPS endpoint, per-session isolation, identity, observability, and runs of up to 8 hours. | Framework-agnostic. AWS names LangGraph, CrewAI and Strands; plain Python works too. |
 
 The layering is a _containment_. The agent and its tools live in your own process; that process is optionally wrapped by AgentCore Runtime; Bedrock is a remote API called outwards from inside. So removing the outer wrapper leaves a working local script, swapping Bedrock for OpenAI changes nothing inside, and swapping Strands for LangGraph changes nothing outside.
+
+Two details about Runtime's isolation are worth knowing early. Each session gets a **dedicated microVM** with its own CPU, memory and filesystem, terminated and memory-sanitised when the session ends — and billing is consumption-based, charging only during active processing rather than while your agent waits on a model or a tool. But **Runtime does not enforce session-to-user mapping**: keeping track of which user owns which session id is your backend's job, not the platform's.
 
 # The Agent Loop
 
@@ -380,7 +382,7 @@ Four steps, none of which you drive:
 
 Building remotely rather than locally is deliberate: Runtime accepts _only_ `linux/arm64`, and building an ARM image on an x86 laptop needs emulation. Handing the build to CodeBuild sidesteps that entirely.
 
-> **Note:** this step creates real, billable resources — an S3 object, an ECR repository holding an image, CodeBuild minutes, and the runtime itself. ECR storage and the runtime persist until deleted, so a deployed agent left behind keeps costing. Check the AWS pricing pages for current rates.
+> **Note:** this creates real billable resources, but not the ones you would guess. **On the default microVM compute type the runtime has no standing charge** — billing is per session, at per-second increments, on actual CPU and peak memory, and CPU spent waiting on a model or a tool is free. An agent left deployed and never called costs nothing to keep. What accrues continuously is the **stored artifact**: ECR image storage for container deployment, or S3 Standard rates on the zip for direct code deployment. CodeBuild minutes are a one-off. The exception is Runtime's other compute type, **Instances**, which bills EC2 cost plus a management fee and therefore does charge while idle. Check the pricing page for current rates.
 
 ## Testing the deployed agent
 
