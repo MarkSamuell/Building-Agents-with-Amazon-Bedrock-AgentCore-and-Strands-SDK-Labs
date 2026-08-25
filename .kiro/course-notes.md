@@ -167,6 +167,8 @@ use the calculator tool. Keep answers friendly, concise, travel-focused."""
 # to None so the function can still be called directly from a test.
 @app.entrypoint
 async def invoke(payload: dict, context=None):
+    # If payload contains "message", user_message gets that value. 
+    # If it does not contain "message", user_message becomes Hello!
     user_message = payload.get("message", "Hello!")
 
     # Built here, inside the handler, rather than at module level -- see below.
@@ -391,3 +393,90 @@ Building remotely rather than locally is deliberate: Runtime accepts _only_ `lin
 > **Note:** the course teaches the Python starter toolkit, whose signature is `configure` writing a `.bedrock_agentcore.yaml`. Running it now prints a deprecation notice: _"The Starter Toolkit CLI is no longer supported"_, directing you to the Node.js AgentCore CLI (`npm install -g @aws/agentcore`), which scaffolds with `create`, stores config under `agentcore/`, and is the only place new AgentCore features appear. `agentcore import` migrates existing agents. Both are invoked as `agentcore` and both have a `deploy`, so `agentcore --help` is what settles which is on your PATH.
 
 > **Note:** a real deploy confirms the build runs in **CodeBuild**, in "codebuild mode", with no CodePipeline anywhere — the toolkit's own output says so. Course material describing a CodePipeline stage is wrong.
+
+# Anatomy of a Custom Tool
+
+Built-in tools proved that tool-use works, but they can only do generic things. An agent for Horizon Travel has to reach data that only Horizon has — its flights. That means writing a tool, and a custom tool is _just a Python function with a decorator_. There is no plugin interface, no registration file, no schema to hand-write.
+
+``` Python
+# =====================================================
+# A CUSTOM TOOL - the whole pattern
+# =====================================================
+from strands import tool
+
+@tool                                        # 1. turn the function into a tool
+def search_flights(origin: str,              # 2. type hints become the input schema
+                   destination: str,
+                   date: str) -> str:        #    the return annotation is yours to choose
+    """
+    Search for available Horizon Travel flights between two airports on a given date.
+
+    Use this tool whenever a customer asks about flight availability,
+    departure times, prices, or seat availability between two cities.
+
+    Args:
+        origin      : IATA airport code for the departure airport (e.g. 'LHR', 'JFK')
+        destination : IATA airport code for the arrival airport (e.g. 'CDG', 'MIA')
+        date        : Travel date in YYYY-MM-DD format (e.g. '2026-03-15')
+
+    Returns:
+        A formatted summary of matching flights, or a message if none found.
+    """
+    # 3. the docstring above is the contract with the model -- see below
+    # 4. load data, filter, and return a formatted string
+```
+
+**The type hints _are_ the schema.** `origin: str` becomes a required string parameter in the JSON schema the model receives. There is no second definition to keep in sync, which is the point — a mismatch between schema and signature is impossible because there is only one of them.
+
+**The docstring is the contract, and it is doing more work than it looks.** Three separate jobs live in it:
+
+| Part of the docstring | What the model uses it for |
+| --- | --- |
+| First line | what the tool *is* |
+| _"Use this tool whenever a customer asks about…"_ | **when to call it** — the decision, not the description |
+| Each `Args:` entry | what each argument *means*, and its format |
+
+That third row is where the real leverage sits. `date : Travel date in YYYY-MM-DD format` is the only thing stopping the model from passing `"next Tuesday"` or `"15/03/2026"`. A format hint in a docstring is _cheaper and more reliable than validation code_, because it prevents the bad call rather than rejecting it. Equally, an unhelpful docstring is a functional bug: the model has nothing else to go on.
+
+## Does `@tool` really "register" the tool?
+
+**No, and the wording matters.** The decorator extracts metadata and builds the schema; it does not put the function anywhere the agent looks. The agent sees a tool only because you passed it in `tools=[...]`.
+
+Strands _does_ have an auto-discovery mechanism — it will load and hot-reload any tool in a `./tools/` directory — but `load_tools_from_directory` **defaults to `False`**, and the docs recommend leaving it off in production. Worth knowing why: with it on, _any_ Python file dropped in that directory gets executed by the agent.
+
+So the mental model is explicit wiring, not discovery. Which is also reassuring: nothing you didn't list can reach the model.
+
+## What can a tool actually return?
+
+The course example returns `str`, and that is the common case, but it is not a requirement. Strands converts the return value in three cases:
+
+| You return | What Strands does |
+| --- | --- |
+| a string or other simple value | wraps it as `{"text": str(result)}` |
+| a dict shaped as a proper `ToolResult` | uses it directly, giving you control of status and content type |
+| an exception is raised | converts it to an error response automatically |
+
+A `ToolResult`'s content can be `text`, `json`, `image` or `document` — so a tool can hand back a picture or a file, not only prose.
+
+That third row deserves attention: **you do not need `try`/`except` for the model's benefit.** A raised exception becomes a tool-error the model can read and react to, often by apologising or trying different arguments. Catching everything and returning `"error"` as a string throws away information the model could have used.
+
+## Two tools, one turn
+
+Wiring a custom tool in is identical to a built-in one — same list, no distinction:
+
+``` Python
+from strands import Agent
+from strands_tools import current_time      # built-in: get the current date and time
+
+agent = Agent(
+    model=model,
+    system_prompt=SYSTEM_PROMPT,
+    tools=[current_time, search_flights],   # built-in and custom, same list
+)
+```
+
+Ask _"Are there flights from LHR to CDG today?"_ and the agent calls `current_time` first, then `search_flights` with the resolved date, and answers — all in one turn.
+
+**No new machinery is involved.** This is the loop from the earlier topic running twice: the model asks for `current_time`, gets a result appended, is called again, and _now_ has enough to ask for `search_flights`. Chaining is not a feature; it is what "loop until the model stops asking" already means. What makes it work is that the model can see the date field wants `YYYY-MM-DD` and that it lacks today's date — both facts coming from docstrings.
+
+> **Note:** some built-in tools prompt for interactive confirmation before acting — those touching files, the shell, or code execution. In a deployed agent there is nobody to answer, so the call blocks. `BYPASS_TOOL_CONSENT=true` disables the prompt. Worth knowing before wiring `shell` or `file_write` into anything that runs unattended.
