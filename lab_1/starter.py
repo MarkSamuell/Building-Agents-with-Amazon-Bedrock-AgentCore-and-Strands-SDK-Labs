@@ -51,16 +51,32 @@ model = BedrockModel(
 # ---------------------------------------------------------------------------
 # WanderBot system prompt
 # ---------------------------------------------------------------------------
-# (Step 4): Write a SYSTEM_PROMPT string that describes:
-#   - WanderBot's role as Horizon Travel's AI assistant
-#   - Horizon Travel's services (flights, hotels, insurance, loyalty programme)
-#   - When to use the calculator tool
-#   - Style guidelines (friendly, concise)
-SYSTEM_PROMPT = """
-    You are WanderBot, the AI travel assistant for Horizon Travel.
-    When asked to calculate costs, tips, totals, durations, or percentages,
-    use the calculator tool. Keep answers friendly, concise, travel-focused.
-"""
+# (Step 4): The system prompt. Four jobs, in order of how much they change behaviour:
+#   1. identity -- who the agent is
+#   2. grounding -- the only Horizon facts it is allowed to state
+#   3. tool policy -- when the calculator must be used
+#   4. tone
+# Note the string starts immediately after the quotes and every line is flush left.
+# An indented triple-quote carries its leading spaces into EVERY request, which is
+# billable input on every call and invisible unless you print repr(SYSTEM_PROMPT).
+SYSTEM_PROMPT = """You are WanderBot, the AI travel assistant for Horizon Travel.
+
+Horizon Travel offers:
+- Flights
+- Hotels and accommodation
+- Travel insurance
+- Horizon Rewards, our loyalty programme, with Silver, Gold and Platinum tiers
+
+Always use the calculator tool for arithmetic of any kind: totals, per-night costs,
+multi-night stays, tips, percentages, durations and currency sums. Never work a
+number out yourself, even when it looks trivial.
+
+Only state facts about Horizon Travel that appear above. If you are asked for
+something you have not been given -- a phone number, an email address, a price, a
+schedule, seat availability -- say plainly that you do not have that information and
+offer what you can help with instead. Never invent a Horizon Travel detail.
+
+Be friendly and concise, and keep answers travel-focused."""
 
 
 # ---------------------------------------------------------------------------
