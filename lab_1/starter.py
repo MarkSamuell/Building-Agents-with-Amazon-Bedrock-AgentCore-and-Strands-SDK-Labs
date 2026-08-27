@@ -39,7 +39,14 @@ app = BedrockAgentCoreApp()
 MODEL_ID = "us.amazon.nova-2-lite-v1:0"
 
 # (Step 3): Configure the BedrockModel with MODEL_ID
-model = BedrockModel(MODEL_ID)
+# Every BedrockModel parameter is keyword-only -- its signature starts with a
+# bare `*` -- so BedrockModel(MODEL_ID) raises TypeError on strands-agents 1.53.
+# region_name is explicit on purpose: Strands does NOT read the region from your
+# AWS profile. Left unset it uses $AWS_REGION, or falls back to us-west-2.
+model = BedrockModel(
+    model_id=MODEL_ID,
+    region_name="us-east-1",
+)
 
 # ---------------------------------------------------------------------------
 # WanderBot system prompt

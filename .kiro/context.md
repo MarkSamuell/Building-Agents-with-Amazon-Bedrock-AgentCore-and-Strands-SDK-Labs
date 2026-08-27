@@ -2,7 +2,9 @@
 
 Labs for the course *Building Agents with Amazon Bedrock AgentCore and Strands
 SDK*, course 1 of the AWS AI Agentic Engineer Nanodegree.
-Last updated 2026-08-24, at set-up. Nothing built yet.
+Last updated 2026-08-27. Module 1 worked through and written up; the labs have
+moved **off the course VM** and now run locally on Mark's Mac, still against the
+Vocareum lab account.
 
 Read this first, then read `.kiro/course-notes.md` before answering anything about
 the course itself -- this file is deliberately short because it loads on every
@@ -15,6 +17,8 @@ turn; the course knowledge lives in `course-notes.md` and is read on demand.
 | Thing | Location |
 | --- | --- |
 | Labs (this repo) | `~/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs` |
+| Lab 1 code | `lab_1/` -- `starter.py`, `requirements.txt`, `README.md` |
+| Python env | `.venv/` at the repo root, created with `uv`. Deps pinned in `lab_1/requirements.txt` |
 | Course notes | `~/Documents/Study-Notes/AI/AWS AI Agentic Engineer Nanodegree/1- Building Agents with Amazon Bedrock AgentCore and Strands SDK.md` |
 | Growing course knowledge | `.kiro/course-notes.md` in this directory |
 
@@ -83,12 +87,13 @@ scratch.
 
 Two accounts are in play, and which one is in use decides who pays.
 
-**Vocareum lab account `484086766087`** -- the course VM authenticates as
-`assumed-role/voclabs` using temporary STS credentials. Anything deployed from
-inside the lab bills to Vocareum's budget, not Mark's. Those credentials expire:
-when they do, calls fail with `ExpiredToken`, and the session token must be
-refreshed from the classroom and re-applied with
-`aws configure set aws_session_token`. Adding credentials is always Mark's action.
+**Vocareum lab account `484086766087`** -- both the course VM and the local
+`udacity-agentic-ai-profile2` authenticate as `assumed-role/voclabs` using temporary
+STS credentials. Anything deployed against it bills to Vocareum's budget, not
+Mark's. Those credentials expire: when they do, calls fail with `ExpiredToken`, and
+the session token must be refreshed from the classroom and re-applied -- in
+`~/.aws-personal/credentials` for local work. Adding credentials is always Mark's
+action.
 
 **CodeBuild is dead in the lab account -- do not re-diagnose this.**
 `agentcore deploy` fails every time with CodeBuild status `STOPPED` 1-4 seconds
@@ -103,15 +108,31 @@ Vocareum's SCP `p-3zsdtilq` from org master `401209005059` -- so the policing
 mechanism is deliberately hidden. `cloudtrail:LookupEvents` is also unavailable.
 Unfixable from inside; escalate to Udacity if a working container deploy is needed.
 
-Routes that do work, or are still untested:
+**Work now happens on Mark's Mac, not the VM**, still against the lab account. The
+Mac is strictly better suited: `arm64` native (Runtime accepts only `linux/arm64`;
+the VM was `amd64`), Python 3.12.12, with `uv` and `docker` already installed.
+`node` is 18.20.2, too old for the Node CLI, which needs 20+.
 
 | Route | State |
 | --- | --- |
-| `agentcore dev` | **Works**, once `pip install uv` is done -- `uv` is the missing dependency, not Docker. Uvicorn on `0.0.0.0:8080` |
-| `python <entrypoint>.py` then curl `localhost:8080` | Works, needs nothing but the deps |
+| `python lab_1/starter.py` then curl `localhost:8080` | Works. Cheapest loop, needs only the venv |
+| `agentcore dev` | Works. Uvicorn + StatReload on `0.0.0.0:8080`. Needs `uv`, not Docker |
 | `agentcore deploy` (CodeBuild) | Permanently blocked, see above |
-| `agentcore deploy --local-build` | Impossible in the lab: no container engine, and the VM is `linux/amd64` while Runtime needs `linux/arm64` |
-| Direct Code Deploy (zip to S3, no CodeBuild) | **Untested.** Only offered when `uv` is present, which it now is. Needs a re-run of `agentcore configure` to switch off container mode. The most promising remaining path |
+| `agentcore deploy --local-build` | **Now viable on the Mac** -- Docker present and arm64 native, so it builds locally and pushes to ECR without touching CodeBuild |
+| `agentcore configure --deployment-type direct_code_deploy` | **Untested, most promising.** Zips to S3; no Docker, no CodeBuild. Caveat: `--runtime` advertises `PYTHON_3_10`/`PYTHON_3_11` while local Python is 3.12 |
+
+**Credentials for the `agentcore` CLI.** It has **no `--profile` option** -- verified
+against the full `configure` and `deploy` help -- and just uses the boto3 chain.
+This session's environment already points `AWS_CONFIG_FILE` and
+`AWS_SHARED_CREDENTIALS_FILE` at `~/.aws-personal/` with no profile name set, so
+whatever is `[default]` there is what the CLI uses. Making
+`udacity-agentic-ai-profile2` that default is the entire fix: one setting covers the
+CLI, boto3 inside the agent, and `use_aws`. **Trap:** run `agentcore` from a terminal
+not launched via `kiro-personal` and those two variables are unset, so it reads
+`~/.aws/` -- the employer store -- instead.
+
+**`agentcore destroy` exists.** Use it to tear down a deployed agent rather than the
+twenty-odd manual delete calls the first two teardowns took.
 
 **Mark's personal account** -- reachable only from a session on his own machine
 through `~/.aws-personal/`. His own money, so state the cost and get confirmation
@@ -122,12 +143,18 @@ section 5 so a later session knows to tear it down.
 
 | Resource | Region | Created | Standing cost | Torn down? |
 | --- | --- | --- | --- | --- |
-| Deploy scaffolding in **Vocareum account 484086766087** for agents `WanderBot` and `Solu`: 2 ECR repos `bedrock-agentcore-<agent>`, 2 CodeBuild projects `bedrock-agentcore-<agent>-builder`, 4 IAM roles `AmazonBedrockAgentCoreSDK{Runtime,CodeBuild}-us-east-1-<hash>`, S3 bucket `bedrock-agentcore-codebuild-sources-<account>-<region>`, 2 CodeBuild log groups. No agent runtime was ever created, since every build was stopped. Each `agentcore deploy` from a new directory mints another full set | us-east-1 | 2026-08-24 | None to Mark -- lab account paid | **Yes, 2026-08-25.** All 11 deleted and verified empty. Note: `.bedrock_agentcore.yaml` in the VM still names the deleted ECR repo and role ARNs, so the next `agentcore deploy` there will reuse dead references instead of recreating -- re-run `agentcore configure` first |
+| All deploy scaffolding in **Vocareum account 484086766087**, across agents `WanderBot`, `Solu` and `solution`: ECR repos `bedrock-agentcore-<agent>`, CodeBuild projects `bedrock-agentcore-<agent>-builder`, IAM roles `AmazonBedrockAgentCoreSDK{Runtime,CodeBuild}-us-east-1-<hash>` (hash is derived from the agent name, so redeploying the same name regenerates identical names), S3 bucket `bedrock-agentcore-codebuild-sources-<account>-<region>`, and CodeBuild log groups. **No agent runtime was ever created**, since every build was stopped | us-east-1 | 2026-08-24 to 08-25 | None to Mark -- lab account paid | **Yes, fully, 2026-08-27.** Verified empty across runtimes, ECR, CodeBuild, logs, S3 and IAM. Note: `.bedrock_agentcore.yaml` in the VM still names deleted ECR repos and role ARNs, so a later `agentcore deploy` there would reuse dead references -- re-run `agentcore configure` first |
+
+**What the whole experiment actually cost: $0.0612**, measured via Cost Explorer, and paid by Vocareum. Breakdown: CodeBuild $0.0560, Bedrock $0.0039, CloudWatch $0.0012, S3 $0.0001, CloudWatch Events $0.00002. **CodeBuild was 92% of it despite every build being killed within 1-4 seconds** -- builds bill in rounded-up minutes, so a build stopped at two seconds costs the same as one that ran for a minute. ECR never appeared as a line item at all, confirming no image was ever pushed.
 
 ## 6. Status
 
 | Item | State |
 | --- | --- |
-| Git repo | Initialised 2026-08-24, branch `main`, root commit `3d1a46a`. No remote -- pushing is Mark's action |
-| Labs | None started |
-| `course-notes.md` | Module 1 intro written 2026-08-24: why a framework, the three layers, the agent loop. Migrates to Study-Notes at course end |
+| Git repo | Initialised 2026-08-24, branch `main`, root commit `3d1a46a`. No remote -- pushing is Mark's action. **Everything since the root commit is uncommitted** |
+| Environment | `.venv` at repo root via `uv`: `bedrock-agentcore` 1.22.0, `bedrock-agentcore-starter-toolkit` 0.3.12, `strands-agents` 1.53.0, `strands-agents-tools` 0.8.6, pinned in `lab_1/requirements.txt` |
+| `lab_1/starter.py` | Imports cleanly, verified. Uses `BedrockModel(model_id=..., region_name="us-east-1")` -- keyword-only is mandatory on strands-agents 1.53, though the VM's older release accepted `model_id` positionally, which is why the course's own file ran there and fails here. **The system prompt still omits Horizon's services**, which exercise Step 4 asks for and which the "customer support" test question is designed to expose |
+| `lab_1/` contents | `starter.py`, `requirements.txt`, `README.md`. **`solution.py` was never copied off the VM**, so there is no reference implementation to diff against |
+| Tool use | **Still never proven.** The VM's `$1,049` answer is arithmetic the model can do unaided, so it does not discriminate. Needs a sum it would fail alone -- 3,247 x 891 = 2,893,077 |
+| `course-notes.md` | Module 1 complete, plus lesson 2 `Anatomy of a Custom Tool`. Fact-checked end to end on 2026-08-25 against the Strands reference and AWS docs; five factual errors corrected. Migrates to Study-Notes at course end |
+| Immediate next steps | 1. Mark sets `udacity-agentic-ai-profile2` as `[default]` in `~/.aws-personal/`. 2. Write the Step 4 system prompt. 3. Run locally and prove tool use. 4. Try direct code deploy. 5. Commit |
