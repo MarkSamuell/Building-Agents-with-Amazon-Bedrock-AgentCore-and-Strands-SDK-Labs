@@ -66,6 +66,8 @@ Not because arithmetic is interesting. Because multi-digit arithmetic is genuine
 
 **Why it is unreliable is worth getting right, because the popular explanation is wrong.** Digit tokenization usually takes the blame, but the research finds the limitation persists _regardless of tokenization scheme_: models learn arithmetic as a hierarchy of symbol-to-symbol mappings rather than as an algorithm, and lean on heuristics such as a one-digit lookahead that collapse once carries cascade. The failure is architectural, not a quirk of the tokenizer — which is why a larger model does not reliably fix it and a calculator does.
 
+> **Note:** on `strands-agents-tools` 0.8.6 `calculator` logs a deprecation warning on every call, and the suggested replacement is `from strands.vended_tools import bash`. **Do not take that advice blindly for an agent exposed to untrusted input.** The warning admits the problem itself: calculator only ever evaluated an expression checked against an _AST allowlist_, whereas bash executes arbitrary commands. Swapping one for the other to silence a warning trades a sandboxed evaluator for a shell — in a component whose arguments are chosen by a language model reacting to whatever a stranger typed into a chat box. The deprecation becomes an error log in v0.9.0, so it needs a decision eventually, but "use bash instead" is a materially wider security boundary and not a like-for-like swap.
+
 ## The minimal agent
 
 ``` Python
@@ -269,6 +271,8 @@ The diagnostic that follows is one step: **curl `/ping` first.** A healthy ping 
 You do. The documentation is explicit that AgentCore _"passes request payloads directly to your container without validation"_ and that _"your container implementation determines which fields are required"_. There is no platform-defined schema, which is why AWS's own examples variously use `prompt`, `query` and `transcript` for the same idea. `message` is this file's private convention, and the caller simply has to match it.
 
 > **Note:** `payload.get("message", "Hello!")` means a caller who sends `{"prompt": "..."}` gets no error — they get WanderBot cheerfully answering "Hello!". Convenient while testing, a silent bug anywhere real. `payload["message"]` fails loudly instead, which is usually what you want. Worse, the bug hides from the obvious test: send the message `"Hello"` and the reply is indistinguishable from the fallback firing. Only a message with specific content in it can tell you the key was read at all.
+>
+> Observed live: `agentcore invoke --dev "Hello"` — the form the CLI itself suggests — does **not** arrive under `message`. The server logged `User: Hello!`, the default, not the `Hello` that was sent. Always pass JSON: `agentcore invoke --dev '{"message": "..."}'`.
 
 ## Why is the Agent rebuilt on every request?
 
@@ -344,7 +348,7 @@ A local server on port 8080 speaking the same contract as Runtime, with hot relo
 
 **It does not run a container, despite course material saying it does.** The proof is local: `dev` runs happily in an environment that reports `No container engine found (Docker/Finch/Podman not installed)`, and the reloader watches the host filesystem directly. So it is the same _application_ and the same _HTTP contract_ as production, but _not_ the same execution environment — which means it cannot catch container-only faults: an import missing from `requirements.txt`, an arm64 incompatibility, or a broken Dockerfile.
 
-_Why it needs `uv` is unverified._ The only observable fact is that it refuses to start without it.
+**What `uv` is actually for** — verified from a real deploy. Runtime is arm64-only, so dependencies have to be built for a platform you are probably not on. `uv` is the cross-compiler: a direct-code deploy logs _"Building dependencies for Linux ARM64 Runtime (manylinux2014_aarch64) — installing dependencies with uv for aarch64-manylinux2014 (cross-compiling for Linux ARM64)"_, then zips and caches the result. It doubles as the local runner: `deploy --local` is documented as "run Python script locally with uv", which is why `dev` refuses to start without it.
 
 ## Iterating on the system prompt cheaply
 
