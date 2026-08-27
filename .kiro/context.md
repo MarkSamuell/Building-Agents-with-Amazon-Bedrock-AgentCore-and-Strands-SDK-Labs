@@ -151,7 +151,17 @@ section 5 so a later session knows to tear it down.
 
 **Observability is partly blocked in the lab account, harmlessly.** `application-signals:StartDiscovery` is denied for `voclabs`, so Transaction Search is skipped, and X-Ray trace delivery then fails validation because it needs that first. Deployment continues and CloudWatch **logs do work**. Not worth chasing.
 
-**Live again as of 2026-08-27 19:09**, from a local `agentcore deploy` for agent `WanderBot2`: ECR repo `bedrock-agentcore-wanderbot2`, IAM roles `AmazonBedrockAgentCoreSDK{Runtime,CodeBuild}-us-east-1-4b11d1ddfa` with policies `BedrockAgentCoreRuntimeExecutionPolicy-WanderBot2` and `CodeBuildExecutionPolicy`, S3 bucket `bedrock-agentcore-codebuild-sources-484086766087-us-east-1`, CodeBuild project `bedrock-agentcore-wanderbot2-builder`. The build was `STOPPED` again, so still no runtime and no ECR image. **Tear down with `agentcore destroy`, not by hand.**
+**Everything torn down 2026-08-27 20:15.** Verified empty across runtimes, ECR, CodeBuild, IAM, S3 and log groups. Only `/aws/application-signals/data` and `aws/spans` remain, both 0 bytes -- AWS's standard observability destinations, left alone deliberately.
+
+**`agentcore destroy` is necessary but not sufficient.** `destroy --force` (plus `--delete-ecr-repo`) removed 9 resources across the two agents: the runtime, both S3 artifacts, the ECR repo, the CodeBuild project, both runtime execution roles, the per-agent config and finally `.bedrock_agentcore.yaml` itself. It **skipped** three things that had to be deleted by hand:
+
+- the **CodeBuild service role** `AmazonBedrockAgentCoreSDKCodeBuild-...`, because the `codebuild:` block in the config was `null` even though the role existed in AWS -- it warned `No CodeBuild execution role configured, skipping IAM cleanup`
+- the **S3 bucket** itself, and any artifact belonging to an agent whose config was already removed
+- **CloudWatch log groups**, both the runtime's and CodeBuild's
+
+So the rule is: run `destroy` first, then enumerate AWS and mop up. Do not treat `destroy` or `.bedrock_agentcore.yaml` as an inventory.
+
+**Live again as of 2026-08-27 19:09**, from a local `agentcore deploy` for agent `WanderBot2`: ECR repo `bedrock-agentcore-wanderbot2`, IAM roles `AmazonBedrockAgentCoreSDK{Runtime,CodeBuild}-us-east-1-4b11d1ddfa` with policies `BedrockAgentCoreRuntimeExecutionPolicy-WanderBot2` and `CodeBuildExecutionPolicy`, S3 bucket `bedrock-agentcore-codebuild-sources-484086766087-us-east-1`, CodeBuild project `bedrock-agentcore-wanderbot2-builder`. The build was `STOPPED` again, so still no runtime and no ECR image.
 
 **The CodeBuild block is now confirmed account-level, not inferred.** The fourth `STOPPED` came from Mark's Mac -- different machine, OS and architecture, fresh roles, new agent name -- with the identical 1-4 second `PROVISIONING` failure. Nothing about the course VM was ever implicated.
 

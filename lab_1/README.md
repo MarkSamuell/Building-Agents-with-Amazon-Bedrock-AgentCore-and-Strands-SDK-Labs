@@ -189,8 +189,33 @@ got there first with fewer moving parts.
 
 ## Outstanding
 
-- **Step 4's system prompt** still omits Horizon's services, which the exercise asks
-  for and which its own "customer support" test question is designed to expose.
-- **Teardown**: agent `WanderBot3` (live runtime + 54.76 MB zip) and `WanderBot2`
-  (ECR repo, CodeBuild project, two roles). Use `agentcore destroy`, not manual
-  deletes — the first two teardowns took twenty-odd API calls each.
+- **Step 4's system prompt** — written 2026-08-27: services, an absolute calculator
+  instruction, an anti-fabrication rule, and tone. Still worth testing against the
+  exercise's "customer support" question, which should now be declined rather than
+  answered with an invention.
+- **Teardown: done, 2026-08-27.** Nothing remains in AWS.
+
+## What teardown actually takes
+
+`agentcore destroy --force` (with `--delete-ecr-repo`) removed nine resources across
+both agents — the runtime, both S3 artifacts, the ECR repository, the CodeBuild
+project, both runtime execution roles, each agent's config entry, and finally
+`.bedrock_agentcore.yaml` itself.
+
+It **skipped three things**, and they had to be deleted by hand:
+
+| Left behind | Why |
+| --- | --- |
+| The **CodeBuild service role** | The `codebuild:` block in the config was `null` even though the role existed in AWS. It warns `No CodeBuild execution role configured, skipping IAM cleanup` |
+| The **S3 bucket** | `destroy` removes artifacts, never the bucket |
+| **CloudWatch log groups** | Both the runtime's and CodeBuild's |
+
+So the working rule is: run `destroy`, then enumerate AWS and mop up. `destroy` reads
+the config file, and the config file is not an inventory of what exists.
+
+`--dry-run` is worth using first — it lists exactly what will go and, more usefully,
+warns about what it is skipping.
+
+Two log groups were left on purpose: `/aws/application-signals/data` and `aws/spans`,
+both 0 bytes. They are AWS's standard observability destinations rather than anything
+this project owns.
