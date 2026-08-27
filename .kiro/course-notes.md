@@ -1,5 +1,169 @@
 > Working copy of a Study-Notes file. Moves to `AI/AWS AI Agentic Engineer Nanodegree/1- Building Agents with Amazon Bedrock AgentCore and Strands SDK.md` when the course finishes.
 
+# What Is AgentCore?
+
+Not one service. AgentCore is a **family of managed pieces for running agents**, and you opt into each one separately. That matters because the name gets used as though it were a single product, which makes the whole thing look larger and more entangled than it is. Most agents use two or three of these and ignore the rest.
+
+| Service | What it does | How you reach it |
+| --- | --- | --- |
+| **AgentCore Runtime** | Hosts your agent: an HTTPS endpoint, per-session isolation, runs up to 8 hours | `agentcore deploy`; `CreateAgentRuntime` / `InvokeAgentRuntime` |
+| **AgentCore Memory** | Managed conversation store — short-term within a session, long-term across them | `agentcore memory` |
+| **AgentCore Gateway** | Turns existing APIs and Lambda functions into MCP tools an agent can call | `agentcore gateway`, `agentcore create_mcp_gateway` |
+| **AgentCore Identity** | Credential providers, so an agent can act as a user against third-party services | `agentcore identity` |
+| **AgentCore Observability** | Traces, spans and metrics for agent behaviour, over OpenTelemetry | `agentcore obs`; injected by `opentelemetry-instrument` |
+| **AgentCore Code Interpreter** | Sandboxed code execution so an agent can compute, plot and analyse data | system ARN `aws.codeinterpreter.v1`, or a custom one |
+| **AgentCore Browser** | A managed headless browser an agent can drive | attached as tool type `agentcore_browser` |
+| **AgentCore Policy** | Fine-grained rules over what an agent and its tools may do | `agentcore policy` |
+| **AgentCore Evaluations** | Built-in and custom evaluators for measuring agent quality | `agentcore eval` |
+| **AgentCore Harness** | AWS runs the agent loop _for_ you — the alternative to bringing your own framework | `CreateHarness` / `InvokeHarness` |
+
+**Harness is the odd one out and worth understanding early.** Everywhere else you write the loop (or Strands writes it) and AgentCore hosts the result. With Harness you hand AWS a model, a system prompt and a list of tools, and _it_ runs the loop server-side. Two different philosophies: bring-your-own-framework versus managed orchestration. These notes follow the first.
+
+## What the infrastructure actually is
+
+Runtime offers two **compute types**, and the difference is the whole cost story:
+
+| | **microVM** (default) | **Instances** |
+| --- | --- | --- |
+| Isolation | a dedicated microVM per session, with its own CPU, memory and filesystem, destroyed and memory-sanitised at session end | AWS-managed EC2 |
+| Billing | per second, on actual CPU and peak memory, across the session lifetime — I/O wait is free | EC2 instance cost plus a management fee |
+| Idle cost | **none** | charged while idle |
+| Suits | almost everything | persistent or resource-heavy workloads |
+
+Two consequences follow. An agent that sits deployed and uncalled costs nothing on microVMs, so there is no reason to tear one down to save money. And because agents spend most of their life waiting on models and tools, paying only for CPU actually consumed is a large saving rather than a rounding error.
+
+One thing Runtime does **not** do: it does not map sessions to users. Session isolation is real, but remembering which person owns which session id is your backend's job.
+
+Everything runs on `linux/arm64`. That single constraint explains more of the tooling than anything else — why builds happen remotely or need `uv`, and why an x86 laptop is at a disadvantage.
+
+With the platform sketched, the rest of these notes work bottom-up: what an agent is, then how to wrap one, then how to ship it.
+
+# What AgentCore Writes On Your Disk
+
+`agentcore configure` produces local files, and reading them is the fastest way to understand what a deployment actually is.
+
+```
+.bedrock_agentcore.yaml              one file, every agent you have configured
+.bedrock_agentcore/
+    WanderBot2/
+        Dockerfile                   container deployments only
+    WanderBot3/
+        dependencies.hash            direct-code deployments only
+        dependencies.zip             direct-code deployments only
+```
+
+## `.bedrock_agentcore.yaml` — the project's memory
+
+Holds a `default_agent` plus a block per agent, which is why `agentcore deploy` and `agentcore invoke` need no arguments. Configuring a second agent silently repoints `default_agent` at it.
+
+The fields worth knowing:
+
+| Field | Why it matters |
+| --- | --- |
+| `entrypoint`, `source_path` | **absolute paths** — the file is not portable between machines |
+| `deployment_type` | `container` or `direct_code_deploy` |
+| `runtime_type` | `PYTHON_3_12` etc. for direct code; `null` for container |
+| `platform` | `linux/arm64` for both types |
+| `ecr_repository` / `s3_path` | one is set and the other `null`, according to deployment type |
+| `bedrock_agentcore.agent_arn` | **`null` until a deploy succeeds.** This is how `invoke` finds your agent |
+| `protocol_configuration` | `HTTP` by default; also `MCP`, `A2A`, `AGUI` |
+| `memory.mode` | `NO_MEMORY` when skipped |
+| `lifecycle_configuration` | `null` means the defaults — 900s idle, 28800s max lifetime |
+
+> **Note:** it is not an inventory of what exists in AWS. A container deploy that dies mid-build still leaves a real CodeBuild project behind while the `codebuild:` block stays `null`. Trusting this file to tell you what to clean up will leave resources running — enumerate AWS itself, or use `agentcore destroy`.
+
+## The generated Dockerfile — what a container deployment really is
+
+You never write it, and it answers several questions at once:
+
+``` Dockerfile
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim   # even the container path is uv-based
+ENV AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1   # region baked into the image
+
+COPY requirements.txt requirements.txt
+RUN uv pip install -r requirements.txt               # THIS is why a missing entry breaks a deploy
+RUN uv pip install aws-opentelemetry-distro==0.12.2  # observability arrives as a dependency
+
+RUN useradd -m -u 1000 bedrock_agentcore
+USER bedrock_agentcore                               # runs non-root
+
+EXPOSE 8080                                          # the contract port
+COPY . .
+CMD ["opentelemetry-instrument", "python", "-m", "starter"]
+```
+
+Three things fall out of that `CMD`.
+
+**The `__main__` guard really does run in production.** `python -m starter` executes the module as `__main__`, so `app.run()` fires inside Runtime. It is not merely a local-testing convenience.
+
+**Your entrypoint becomes a Python module name.** `-m starter` means the file must be importable as a module — which is why a source directory containing spaces breaks a deployment before anything else does.
+
+**Observability is a wrapper, not code you write.** `opentelemetry-instrument` wraps your process and instruments it; that is the entire mechanism.
+
+The baked-in `AWS_REGION` also quietly fixes something: Strands falls back to `$AWS_REGION` when `region_name` is unset, so a container deployment gets the right region even if the code never says so. Run the same code locally without that variable and it would reach for us-west-2 instead.
+
+## `dependencies.hash` and `dependencies.zip`
+
+Direct-code deployments only. The `.zip` is your dependencies cross-compiled for `manylinux2014_aarch64`; the `.hash` is a single SHA-256 of the inputs, used as a cache key. First deploy logs "No cached dependencies found, will build" and then "Dependencies cached"; later deploys reuse the zip unless the hash changes. `--force-rebuild-deps` overrides it.
+
+Worth knowing the size: for four dependencies the zip came to **54.76 MB**, and that artifact in S3 — not the idle runtime — is the standing cost of a direct-code deployment.
+
+# Who Is Allowed To Do What
+
+The course hands you `--execution-role` and moves on, which hides the fact that **four different identities** are involved in getting an agent running. Confusing them is the source of most AgentCore permission errors, because each fails at a different moment and with a different message.
+
+| Identity | Who it is | What it needs | When it fails |
+| --- | --- | --- | --- |
+| **The deployer** | you, or your CI | create IAM roles, ECR repos, S3 buckets, CodeBuild projects; `CreateAgentRuntime`; `iam:PassRole` | at `deploy`, before anything runs |
+| **The execution role** | assumed by the agent while it runs | `bedrock:InvokeModel`, CloudWatch Logs, plus whatever its tools touch | at first invocation, inside the agent |
+| **The CodeBuild service role** | assumed by CodeBuild to build the image | ECR push, S3 read, logs | mid-build, container deployments only |
+| **The caller** | whoever invokes the deployed agent | `bedrock-agentcore:InvokeAgentRuntime` | at `invoke`, from outside |
+
+The toolkit creates the middle two for you and names them predictably: `AmazonBedrockAgentCoreSDKRuntime-<region>-<hash>` and `AmazonBedrockAgentCoreSDKCodeBuild-<region>-<hash>`. The hash is derived from the agent name, so deleting a role and redeploying the same agent regenerates an identically named one.
+
+## The trust policy, and why it carries conditions
+
+An execution role is useless unless the service is allowed to assume it. The documented policy:
+
+``` json
+{
+  "Effect": "Allow",
+  "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
+  "Action": "sts:AssumeRole",
+  "Condition": {
+    "StringEquals": { "aws:SourceAccount": "123456789012" },
+    "ArnLike": { "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:*" }
+  }
+}
+```
+
+The two conditions are **confused-deputy protection**, and they are the part people delete when "it doesn't work". Without them, the AgentCore service principal could be induced to assume your role on behalf of _someone else's_ account — a stranger creates a runtime, names your role, and the service dutifully assumes it. `aws:SourceAccount` and `aws:SourceArn` bind the assumption to resources in your own account.
+
+## Why the role names matter more than they look
+
+AWS's managed policy for AgentCore grants `iam:PassRole` **only for roles whose name matches `*BedrockAgentCore*`**. So the toolkit's verbose naming is not cosmetic — it is what makes the managed policy work at all. Rename a role to something tidier and `PassRole` silently stops applying to it.
+
+Two further gaps in that managed policy are worth knowing:
+
+- **`iam:CreateRole` is not included.** Auto-creating an execution role needs a permission the managed policy does not grant, which is why "let the toolkit create one" fails in tightly scoped accounts.
+- **`GetWorkloadAccessTokenForUserId` is included, and shouldn't be in production.** It issues workload tokens from a caller-supplied user-id string _without verifying any identity provider token_. The production form is `GetWorkloadAccessTokenForJWT`, which validates signature, issuer and expiry; AWS suggests explicitly denying the UserId variant once your workloads always carry a JWT.
+
+## What the execution role actually needs
+
+At minimum: model invocation and logs. The model half is the fiddly part and is covered under _The model id is not a model id_ below — two ARN forms, two actions, and model access enabled in every destination region.
+
+Beyond that, the role needs whatever its **tools** need, and this is where least privilege earns its keep: a tool that reads S3 means the agent can read S3, for the whole session, whatever the model decides to ask for.
+
+If AgentCore Memory is enabled, the role also needs event and record actions on the memory resource. It surfaces as an `AccessDeniedException` on `bedrock-agentcore:ListEvents` at the _first_ invocation, before the model is ever called — because memory is read at the start of a turn, not written at the end. Observed rather than documented.
+
+## Two invoke actions, and an escalation trap
+
+Callers need `bedrock-agentcore:InvokeAgentRuntime`. There is a second action, `InvokeAgentRuntimeForUser`, which invokes on behalf of an end user via the `X-Amzn-Bedrock-AgentCore-Runtime-User-Id` header — powerful, and worth denying explicitly where it isn't needed.
+
+The subtler rule, from AWS's own security guidance: **the execution role should have equal or fewer privileges than the principals allowed to invoke the agent.** Otherwise invoking the agent _is_ a privilege escalation — a caller who can't read a bucket directly simply asks an agent whose role can.
+
+> **Note:** AWS is blunt about the roles the toolkit generates: _"Do not use CLI-generated policies in production — the IAM policies created by the AgentCore CLI are designed for development and testing purposes. These permissions grant broad access and are not suitable for production."_ Anything created by pressing Enter at the `configure` prompts falls in that category.
+
 # Why an Agent Framework?
 
 A foundation model does one thing: it takes a prompt and returns a completion. It cannot look anything up, cannot reliably do arithmetic, and cannot act on the world. Modern models accept more than text — Nova 2 Lite takes image and video input too — but the shape is unchanged: something goes in, text comes out, and nothing happens. Everything interesting that an "AI agent" appears to do comes from code _around_ the model, not from the model itself.
