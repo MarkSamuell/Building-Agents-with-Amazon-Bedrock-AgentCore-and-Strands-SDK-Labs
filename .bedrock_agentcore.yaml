@@ -1,75 +1,15 @@
 default_agent: WanderBot3
 agents:
-  WanderBot2:
-    name: WanderBot2
-    language: python
-    node_version: '20'
-    entrypoint: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_1/starter.py
-    deployment_type: container
-    runtime_type: null
-    platform: linux/arm64
-    container_runtime: none
-    source_path: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_1
-    aws:
-      execution_role: arn:aws:iam::484086766087:role/AmazonBedrockAgentCoreSDKRuntime-us-east-1-4b11d1ddfa
-      execution_role_auto_create: false
-      account: '484086766087'
-      region: us-east-1
-      ecr_repository: 484086766087.dkr.ecr.us-east-1.amazonaws.com/bedrock-agentcore-wanderbot2
-      ecr_auto_create: false
-      s3_path: null
-      s3_auto_create: false
-      network_configuration:
-        network_mode: PUBLIC
-        network_mode_config: null
-      protocol_configuration:
-        server_protocol: HTTP
-      observability:
-        enabled: true
-      lifecycle_configuration:
-        idle_runtime_session_timeout: null
-        max_lifetime: null
-    bedrock_agentcore:
-      agent_id: null
-      agent_arn: null
-      agent_session_id: null
-    codebuild:
-      project_name: null
-      execution_role: null
-      source_bucket: null
-    memory:
-      mode: NO_MEMORY
-      memory_id: null
-      memory_arn: null
-      memory_name: null
-      event_expiry_days: 30
-      first_invoke_memory_check_done: false
-      was_created_by_toolkit: false
-    identity:
-      credential_providers: []
-      workload: null
-    aws_jwt:
-      enabled: false
-      audiences: []
-      signing_algorithm: ES384
-      issuer_url: null
-      duration_seconds: 300
-    authorizer_configuration: null
-    request_header_configuration: null
-    oauth_configuration: null
-    api_key_env_var_name: null
-    api_key_credential_provider_name: null
-    is_generated_by_agentcore_create: false
   WanderBot3:
     name: WanderBot3
     language: python
     node_version: '20'
-    entrypoint: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_1/starter.py
+    entrypoint: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_2/starter.py
     deployment_type: direct_code_deploy
     runtime_type: PYTHON_3_12
     platform: linux/arm64
     container_runtime: null
-    source_path: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_1
+    source_path: /Users/sammarkg/Documents/Personal Projects/Building-Agents-with-Amazon-Bedrock-AgentCore-and-Strands-SDK-Labs/lab_2
     aws:
       execution_role: arn:aws:iam::484086766087:role/AmazonBedrockAgentCoreSDKRuntime-us-east-1-e0238e14b6
       execution_role_auto_create: false
@@ -90,9 +30,9 @@ agents:
         idle_runtime_session_timeout: null
         max_lifetime: null
     bedrock_agentcore:
-      agent_id: WanderBot3-MceMqz5L8c
-      agent_arn: arn:aws:bedrock-agentcore:us-east-1:484086766087:runtime/WanderBot3-MceMqz5L8c
-      agent_session_id: 9db26b62-37d2-4707-83b1-46117d844526
+      agent_id: WanderBot3-jJXNSUD2VQ
+      agent_arn: arn:aws:bedrock-agentcore:us-east-1:484086766087:runtime/WanderBot3-jJXNSUD2VQ
+      agent_session_id: 7844444a-b51f-4d9f-90cf-5a30ef717eee
     codebuild:
       project_name: null
       execution_role: null

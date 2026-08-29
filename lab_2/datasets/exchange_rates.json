@@ -1,0 +1,27 @@
+{
+  "base_currency": "USD",
+  "last_updated": "2026-03-11",
+  "note": "Mock exchange rates for educational use only. Not for financial transactions.",
+  "rates": {
+    "EUR": 0.92,
+    "GBP": 0.79,
+    "JPY": 149.50,
+    "AUD": 1.54,
+    "CAD": 1.36,
+    "CHF": 0.90,
+    "SGD": 1.34,
+    "HKD": 7.82,
+    "NZD": 1.65,
+    "SEK": 10.45,
+    "NOK": 10.72,
+    "DKK": 6.88,
+    "AED": 3.67,
+    "THB": 34.80,
+    "MXN": 17.25
+  },
+  "supported_currencies": [
+    "EUR", "GBP", "JPY", "AUD", "CAD",
+    "CHF", "SGD", "HKD", "NZD", "SEK",
+    "NOK", "DKK", "AED", "THB", "MXN"
+  ]
+}
