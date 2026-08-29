@@ -1,15 +1,15 @@
-# Direct dependencies only, pinned to the versions resolved on 2026-08-27.
-# This file is also what the container build installs, so anything imported by
-# the agent must appear here -- an import that works locally and is missing here
-# is the commonest way a first deployment fails.
+# Runtime dependencies only, pinned to the versions resolved on 2026-08-27.
+# This file is what the deployment installs, so anything imported by the agent must
+# appear here -- an import that works locally and is missing here is the commonest
+# way a first deployment fails.
+#
+# NOT listed on purpose: bedrock-agentcore-starter-toolkit. That is the `agentcore`
+# CLI, a development tool. Listing it here shipped ~9 MB of CLI into the deployment
+# package for no reason -- lab 1's zip came to 54.76 MB against lab 2's 45.68 MB for
+# the same four imports. Install it in your venv, not in requirements.txt.
 
 # The AgentCore runtime wrapper: BedrockAgentCoreApp and @app.entrypoint.
 bedrock-agentcore==1.22.0
-
-# The agentcore CLI: configure / dev / deploy / invoke.
-# Prints a deprecation notice pointing at the Node CLI (@aws/agentcore); the
-# course teaches this one.
-bedrock-agentcore-starter-toolkit==0.3.12
 
 # The agent loop, model providers, and the @tool decorator.
 strands-agents==1.53.0

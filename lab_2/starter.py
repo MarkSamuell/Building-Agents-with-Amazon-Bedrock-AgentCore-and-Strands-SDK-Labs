@@ -22,10 +22,9 @@ from pathlib import Path
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 # TODO (Step 1): Import `tool` from strands (alongside Agent)
 from strands import Agent, tool
-from strands import Agent
 from strands.models import BedrockModel
 # TODO (Step 1): Import `current_time` from strands_tools
-from strands_tools import current_time 
+from strands_tools import current_time
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -52,7 +51,13 @@ EXCHANGE_FILE = DATA_DIR / "exchange_rates.json"
 app = BedrockAgentCoreApp()
 
 MODEL_ID = "us.amazon.nova-2-lite-v1:0"
-model = BedrockModel(model_id=MODEL_ID)
+# region_name is explicit on purpose: Strands does NOT read the region from your
+# AWS profile. Left unset it uses $AWS_REGION, or falls back to us-west-2 -- where
+# Nova 2 Lite access has not been enabled.
+model = BedrockModel(
+    model_id=MODEL_ID,
+    region_name="us-east-1",
+)
 
 SYSTEM_PROMPT = """You are WanderBot, the AI travel assistant for Horizon Travel.
 

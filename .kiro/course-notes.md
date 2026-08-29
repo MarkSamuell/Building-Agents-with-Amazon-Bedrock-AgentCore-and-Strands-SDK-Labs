@@ -19,6 +19,8 @@ Not one service. AgentCore is a **family of managed pieces for running agents**,
 
 **Harness is the odd one out and worth understanding early.** Everywhere else you write the loop (or Strands writes it) and AgentCore hosts the result. With Harness you hand AWS a model, a system prompt and a list of tools, and _it_ runs the loop server-side. Two different philosophies: bring-your-own-framework versus managed orchestration. These notes follow the first.
 
+> **Note:** one object, three vocabularies. The thing you deploy is an **agent** in the console (`/bedrock-agentcore/agents/<id>`), an **agent runtime** in the API and CLI (`list-agent-runtimes`, `agentRuntimeArn`), and just an **agent** in the toolkit's own output. Worth knowing when searching documentation, because the three sets of results barely overlap.
+
 ## What the infrastructure actually is
 
 Every session gets a **dedicated microVM** with its own CPU, memory and filesystem, destroyed and memory-sanitised when the session ends, and able to live for up to 8 hours. That is the isolation boundary: code running for one caller cannot reach another's session, and nothing survives the session unless you deliberately store it.
@@ -526,6 +528,23 @@ The inference-profile ARN _includes_ the account id. The foundation-model ARN ha
 **Model access must be enabled in every destination region, not just yours.** A geographic profile dispatches across the regions in its geography, and the underlying model has to be enabled in each of them. Enabling access in your source region alone leaves the profile free to route to a region where you have none.
 
 Granting only the profile ARN produces an authorization failure that names nothing useful, and reads at first glance as though the model does not exist.
+
+## Two regions, and nothing links them
+
+There are two regions in play, they mean different things, and they are set in completely different places:
+
+| Region | What it decides | Set by |
+| --- | --- | --- |
+| **Where the agent is hosted** | which region holds the runtime, its execution role, its log group | `agentcore configure --region` |
+| **Where Bedrock is called from** | which region serves the model | `region_name` on `BedrockModel` |
+
+**Nothing ties one to the other.** A runtime hosted in us-east-1 will cheerfully call Bedrock in us-west-2, because Strands resolves its own region independently: `region_name` if you passed it, otherwise `$AWS_REGION`, otherwise **us-west-2** as a hardcoded fallback. It does _not_ read the region from your AWS profile, so `aws configure set region` has no effect on it whatsoever.
+
+The mismatch surfaces as an `AccessDenied` on a model you are certain you enabled — because you enabled it in the region you were thinking about and the call went somewhere else. Passing `region_name` explicitly means the question never arises.
+
+A container deployment hides this, which is its own hazard: the generated Dockerfile bakes in `AWS_REGION`, so the fallback lands somewhere sensible in production and the same code misbehaves only when run locally.
+
+> **Note:** you cannot verify it by reading `model.config`. `region_name` is a constructor parameter consumed by `__init__` to build the boto client, while `config` holds only the `**model_config` fields such as `model_id`. Its absence there means nothing. The real check is `model.client.meta.region_name`.
 
 # How Does the Agent Get to Runtime?
 
