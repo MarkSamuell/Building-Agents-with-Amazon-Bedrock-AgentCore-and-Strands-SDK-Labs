@@ -21,22 +21,13 @@ Not one service. AgentCore is a **family of managed pieces for running agents**,
 
 ## What the infrastructure actually is
 
-Runtime offers two **compute types**, and the difference is the whole cost story:
-
-| | **microVM** (default) | **Instances** |
-| --- | --- | --- |
-| Isolation | a dedicated microVM per session, with its own CPU, memory and filesystem, destroyed and memory-sanitised at session end | AWS-managed EC2 |
-| Billing | per second, on actual CPU and peak memory, across the session lifetime — I/O wait is free | EC2 instance cost plus a management fee |
-| Idle cost | **none** | charged while idle |
-| Suits | almost everything | persistent or resource-heavy workloads |
-
-Two consequences follow. An agent that sits deployed and uncalled costs nothing on microVMs, so there is no reason to tear one down to save money. And because agents spend most of their life waiting on models and tools, paying only for CPU actually consumed is a large saving rather than a rounding error.
+Every session gets a **dedicated microVM** with its own CPU, memory and filesystem, destroyed and memory-sanitised when the session ends, and able to live for up to 8 hours. That is the isolation boundary: code running for one caller cannot reach another's session, and nothing survives the session unless you deliberately store it.
 
 One thing Runtime does **not** do: it does not map sessions to users. Session isolation is real, but remembering which person owns which session id is your backend's job.
 
 Everything runs on `linux/arm64`. That single constraint explains more of the tooling than anything else — why builds happen remotely or need `uv`, and why an x86 laptop is at a disadvantage.
 
-With the platform sketched, the rest of these notes work bottom-up: what an agent is, then how to wrap one, then how to ship it.
+With the platform sketched, the rest of these notes work bottom-up: the deployment choices, then what an agent is, then how to wrap one, then how to ship it.
 
 # What AgentCore Writes On Your Disk
 
@@ -163,6 +154,79 @@ Callers need `bedrock-agentcore:InvokeAgentRuntime`. There is a second action, `
 The subtler rule, from AWS's own security guidance: **the execution role should have equal or fewer privileges than the principals allowed to invoke the agent.** Otherwise invoking the agent _is_ a privilege escalation — a caller who can't read a bucket directly simply asks an agent whose role can.
 
 > **Note:** AWS is blunt about the roles the toolkit generates: _"Do not use CLI-generated policies in production — the IAM policies created by the AgentCore CLI are designed for development and testing purposes. These permissions grant broad access and are not suitable for production."_ Anything created by pressing Enter at the `configure` prompts falls in that category.
+
+# Deployment Options
+
+"How do I deploy an agent" is really **four independent questions**, and the tooling conflates them badly enough that the choices look like more work than they are:
+
+1. What **artifact** does Runtime receive — an image, or a zip?
+2. Where does that artifact get **built** — in the cloud, or on your machine?
+3. Where does it **run** — Runtime, or locally?
+4. What **compute type** runs it — serverless microVMs, or dedicated instances?
+
+Only the first is a real architectural decision. The rest follow from it, or from what your laptop happens to have installed.
+
+## 1. The artifact: container or direct code
+
+| | **Container** | **Direct code** |
+| --- | --- | --- |
+| What Runtime gets | an ARM64 OCI image | a zip of source plus dependencies |
+| Built from | a Dockerfile the toolkit generates for you | `uv`, cross-compiling wheels for `manylinux2014_aarch64` |
+| Stored in | **ECR** | **S3** |
+| Config records | `ecr_repository`; `runtime_type: null` | `s3_path`; `runtime_type: PYTHON_3_12` |
+| Language | anything you can put in an image | **Python only** |
+| Iteration | slower — every change is an image build and push | faster; dependencies are cached by hash and reused |
+| Standing cost | ECR image storage | S3 Standard on the zip |
+
+The generated Dockerfile is worth reading once — it is covered under _What AgentCore Writes On Your Disk_ — because it shows that even the container path is `uv`-based underneath, and that observability arrives as a wrapped `CMD` rather than anything you write.
+
+**Direct code is not "container, but worse".** It is a genuinely different contract: you hand over source and a Python version, and AWS supplies the runtime image. That is why it needs `--runtime PYTHON_3_10` through `PYTHON_3_13`, and why the container path has no equivalent flag — with a container, *you* are the one who chose the interpreter.
+
+## 2. Where it builds and runs: three modes
+
+`agentcore deploy` has three modes, and which are available depends on the artifact type:
+
+| Mode | Container | Direct code |
+| --- | --- | --- |
+| **default**, no flags | CodeBuild builds the ARM64 image in the cloud. No local Docker needed | zips and uploads; nothing to build remotely |
+| **`--local`** | builds *and runs* the container on your machine. Needs Docker, Finch or Podman | runs the script locally with `uv`. Not a deployment — this is development |
+| **`--local-build`** | Docker builds the image locally, then it deploys to cloud Runtime | **not supported** |
+
+Two things fall out of that table. `--local-build` exists for exactly one situation: you want a cloud deployment but need control over the build, or cloud building is unavailable to you. And `--local` is not a deployment at all in either column — it is the same idea as `agentcore dev`, minus the hot reload.
+
+The arm64 constraint decides a lot here. Building an ARM image on an x86 machine needs QEMU emulation and is slow; on Apple Silicon it is native. Handing the build to CodeBuild sidesteps the question entirely, which is why it is the default.
+
+## 3. Compute type: the cost axis
+
+Independent of everything above, Runtime runs your agent on one of two compute types:
+
+| | **microVM** (default) | **Instances** |
+| --- | --- | --- |
+| What it is | serverless, one microVM per session | AWS-managed EC2 |
+| Billing | per second, on actual CPU and peak memory consumed | EC2 instance cost plus a management fee |
+| Idle cost | **none** | charged while idle |
+| Suits | almost everything | persistent or resource-heavy workloads |
+
+Two consequences. An agent sitting deployed and uncalled costs nothing on microVMs, so there is no reason to tear one down to save money — only its stored artifact accrues. And since agents spend most of their life waiting on models and tools, being billed only for CPU actually burned is a large saving rather than a rounding error.
+
+## 4. What protocol it speaks
+
+A last axis, easy to miss: `--protocol` accepts `HTTP`, `MCP`, `A2A` and `AGUI`. Runtime will host an MCP server or an agent-to-agent endpoint as readily as an HTTP agent — the container contract differs, but the deployment machinery is identical. Everything in these notes uses `HTTP`.
+
+## So which one?
+
+The deciding question is short: **does your agent need anything that is not a Python package?**
+
+| Situation | Choice |
+| --- | --- |
+| Pure Python agent, want the fastest loop | **Direct code, default mode.** Fewest moving parts; no Docker anywhere |
+| Needs system packages, a compiled binary, a non-Python runtime, or a specific base image | **Container, default mode.** CodeBuild builds it; you still need no local Docker |
+| Container needed, but you must control the build — or cloud build is blocked or unavailable | **Container, `--local-build`.** Requires Docker; painless on arm64, slow under emulation |
+| Just iterating on prompts and tool wiring | **Neither.** `agentcore dev`, or plain `python <file>.py` |
+| Long-running, resource-hungry, or needs warm state | Either artifact, on the **Instances** compute type, accepting idle billing |
+| You would rather not write or deploy an agent at all | **AgentCore Harness** — hand AWS a model, a prompt and tools, and it runs the loop |
+
+> **Note:** the two artifact types are not a one-way door, but switching is not free either. The deployment type is recorded per agent in `.bedrock_agentcore.yaml` along with type-specific fields, so reconfiguring an existing agent from container to direct code leaves a stale `ecr_repository` behind. Cleaner to configure a fresh agent name and delete the old one.
 
 # Why an Agent Framework?
 
@@ -486,17 +550,6 @@ An interactive prompt that writes your answers to disk. What the course chooses:
 | **Memory** | skipped | consistent with the stateless agent above; memory is added in a later module |
 
 **Two files appear that you did not write** `.bedrock_agentcore.yaml`, holding every answer above so later commands need no arguments, and a generated `Dockerfile` describing the image. Both are worth reading once — they are the only place the deployment's actual shape is written down.
-
-## Container or zip?
-
-The configure menu offers two deployment types, and the difference is worth knowing even though the course fixes on one.
-
-| | **Container** (the course's choice) | **Direct code** (zip) |
-| --- | --- | --- |
-| Artifact | an ARM64 Docker image in ECR | a zip of code and dependencies in S3 |
-| Steps | Dockerfile → build → push to ECR → deploy | package → upload → deploy |
-| Iteration speed | slower; every change is a rebuild | faster, which is the point of it |
-| Suits | custom system dependencies, existing container pipelines | rapid prototyping |
 
 ## What `agentcore dev` actually runs
 
