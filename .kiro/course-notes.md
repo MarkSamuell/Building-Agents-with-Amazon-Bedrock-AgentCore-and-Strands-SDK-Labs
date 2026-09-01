@@ -779,6 +779,46 @@ class FlightSearchInput(BaseModel):
 
 Now `"banana"` and `"15/03/2026"` fail with `date_from_datetime_parsing`, `"lhr"` and `"LONDON"` fail with `string_pattern_mismatch`, and `"2026-03-15"` is _parsed into a real `datetime.date`_ rather than left as a string. That last part matters: a validated model should hand you a usable object, not a string you still have to parse.
 
+## What does `Optional[str] = Field(default=None)` actually declare?
+
+Three separate things live in that one line, and the middle one is the part almost everyone misreads:
+
+``` Python
+check_in_time: Optional[str] = Field(default=None, description="Check-in time, e.g. '15:00'")
+#     ^              ^                    ^                          ^
+#   name       type annotation         default                    metadata
+```
+
+- `Optional[str]` is shorthand for `str | None` — the **value** may be a string or null.
+- `default=None` says the **key** may be absent from the input.
+- `description=...` is documentation; it constrains nothing.
+
+**`Optional` does not make a field optional.** It makes the value _nullable_. Omittability comes from the default alone, and in Pydantic v2 those are independent axes:
+
+``` Python
+class A(BaseModel): x: str                                  # required, no null
+class B(BaseModel): x: Optional[str]                        # required, null allowed
+class C(BaseModel): x: Optional[str] = Field(default=None)  # omittable, null allowed
+class D(BaseModel): x: str = Field(default="15:00")         # omittable, no null
+```
+
+Run against all three cases, the results are:
+
+| Declaration | key omitted | value is `null` | value is `'15:00'` |
+| --- | --- | --- | --- |
+| `x: str` | error `missing` | error `string_type` | ✓ |
+| `x: Optional[str]` | **error `missing`** | ✓ → `None` | ✓ |
+| `x: Optional[str] = None` | ✓ → `None` | ✓ → `None` | ✓ |
+| `x: str = "15:00"` | ✓ → `'15:00'` | error `string_type` | ✓ |
+
+Row two is the surprise: **`Optional[str]` with no default is still required.** All the annotation bought you is the right to pass an explicit `null`.
+
+> **Note:** this changed between versions. In Pydantic **v1**, `Optional[str]` implied a default of `None`, so `Optional` genuinely did mean skippable. **v2 separated the two ideas.** Any tutorial or answer describing `Optional` as making a field omittable is describing v1.
+
+`Field(default=None)` is simply `= None` with metadata attached — `x: Optional[str] = None` behaves identically. Reach for `Field(...)` only when you also want a description or a constraint.
+
+It also changes what a tool emits. `model_dump_json()` renders an absent value as `null` rather than dropping the key, so the model receives `{"check_in_time": null}`. That is exactly the trade a nullable results field makes: the caller gets the record with one blank field instead of losing the whole record.
+
 ## Do the `Field(description=...)` strings reach the model?
 
 **Not in this design, no.** It is tempting to think adding descriptions to a Pydantic model tightens the contract with the LLM. It doesn't, because the model never sees that schema.
