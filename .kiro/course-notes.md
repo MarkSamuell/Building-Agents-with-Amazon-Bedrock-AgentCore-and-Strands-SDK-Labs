@@ -722,3 +722,103 @@ Ask _"Are there flights from LHR to CDG today?"_ and the agent calls `current_ti
 **No new machinery is involved.** This is the loop from the earlier topic running twice: the model asks for `current_time`, gets a result appended, is called again, and _now_ has enough to ask for `search_flights`. Chaining is not a feature; it is what "loop until the model stops asking" already means. What makes it work is that the model can see the date field wants `YYYY-MM-DD` and that it lacks today's date — both facts coming from docstrings.
 
 > **Note:** some built-in tools prompt for interactive confirmation before acting — those touching files, the shell, or code execution. In a deployed agent there is nobody to answer, so the call blocks. `BYPASS_TOOL_CONSENT=true` disables the prompt. Worth knowing before wiring `shell` or `file_write` into anything that runs unattended.
+
+# Structured Outputs
+
+Text is for humans; structure is for systems. An agent that summarises a support call in prose is useful to a person reading it. An agent that returns `{"issue_type": "login_problem", "urgency": "high"}` can open a ticket, page someone, or update a dashboard without anyone reading anything. That is the whole motivation: **structure is what lets an agent be a component rather than a conversation.**
+
+## Why asking for JSON is not enough
+
+The naive approach is to put it in the prompt — _"reply as JSON with fields issue_type, urgency, customer_email"_. It works often enough to be dangerous, and fails in a specific way: you get **syntactically fine JSON with semantically useless values**. `"urgency": "very"`. `"customer_email": "none found"`. Both parse; neither is usable.
+
+The reason is worth stating precisely. A model is trained to produce plausible text, and a schema is a _type contract_. Nothing in next-token prediction enforces "this field is one of three enum values". Asking politely does not change the mechanism.
+
+## Four levels of enforcement, and where each acts
+
+These are usually discussed as one topic, but they intervene at different points and give different guarantees:
+
+| Level | What it does | Where it acts | Guarantees | Tool used | Example |
+| --- | --- | --- | --- | --- | --- |
+| **Prompt instruction** | asks for JSON | nowhere | nothing | the system prompt | `"Reply as JSON with fields issue_type, urgency"` |
+| **Tool / function schema** | model must emit a structured call matching a JSON schema | the model API | _shape_ — right fields, right JSON types | Strands `@tool`; `toolConfig`/`toolSpec` on Bedrock `Converse` | `def search_flights(origin: str, date: str)` — schema built from the signature and docstring |
+| **Constrained decoding** | the schema is compiled into a grammar so invalid tokens cannot be produced | inside the model's sampler | shape, at generation time | `BedrockModel(strict_tools=True)` | injects `strict: true` per tool spec and `additionalProperties: false` into object schemas |
+| **Runtime validation** | rejects or coerces what arrived | your code | _semantics_ — whatever you actually assert | Pydantic `BaseModel`, `Field`, `model_validate` | `date: Date = Field(...)` rejects `"banana"` and parses `"2026-03-15"` into a real `datetime.date` |
+
+They stack rather than compete: a tool schema gets you the envelope, constrained decoding stops the model producing a malformed one, and validation is the only level that checks whether the contents mean anything. Strands' `agent.structured_output()` is rows 2 and 4 together — it generates a tool spec from your Pydantic model, then validates the reply against it.
+
+On Bedrock, constrained decoding (row 3) is reachable through `strict_tools` on `BedrockModel`, which adds `strict: true` to each tool spec and injects `additionalProperties: false` into object schemas. It is not free: strict mode restricts which JSON Schema features a tool may use — `oneOf` is unsupported, and optional parameters are capped across all tools in a request — and a schema using an unsupported feature fails at request time with a `ValidationException`.
+
+## What does a tool schema actually guarantee?
+
+**Shape, not meaning.** This is the distinction everything else hangs off. Declare `date: str` and you are guaranteed a string. You are not guaranteed a _date_. `"next Tuesday"`, `"15/03/2026"` and `"banana"` are all perfectly valid values for a field typed `str`.
+
+So function calling does not "guarantee correct format and types" in the sense people hope. It guarantees the envelope. What is inside the envelope is your problem, which is exactly why validation exists.
+
+## Does `FlightSearchInput` reject a bad date?
+
+**No — and this is worth knowing before trusting it.** The demo's model looks like a guard:
+
+``` Python
+class FlightSearchInput(BaseModel):
+    origin: str = Field(description="IATA departure airport code, e.g. LHR")
+    destination: str = Field(description="IATA arrival airport code, e.g. CDG")
+    date: str = Field(description="Travel date in YYYY-MM-DD format, e.g. 2026-03-15")
+```
+
+Tested directly, every one of these is **accepted**: `date="next Tuesday"`, `date="15/03/2026"`, `date="banana"`, `date=""`. The only thing rejected is a _missing_ field. All three fields are unconstrained `str`, and `Field(description=...)` is documentation — it constrains nothing.
+
+`description` describes. To validate, you need a **type or a constraint**:
+
+``` Python
+from datetime import date as Date
+
+class FlightSearchInput(BaseModel):
+    origin: str = Field(description="IATA departure airport code", pattern=r"^[A-Z]{3}$")
+    date: Date = Field(description="Travel date in YYYY-MM-DD format")
+```
+
+Now `"banana"` and `"15/03/2026"` fail with `date_from_datetime_parsing`, `"lhr"` and `"LONDON"` fail with `string_pattern_mismatch`, and `"2026-03-15"` is _parsed into a real `datetime.date`_ rather than left as a string. That last part matters: a validated model should hand you a usable object, not a string you still have to parse.
+
+## Do the `Field(description=...)` strings reach the model?
+
+**Not in this design, no.** It is tempting to think adding descriptions to a Pydantic model tightens the contract with the LLM. It doesn't, because the model never sees that schema.
+
+`@tool` builds the tool specification from the **function signature and docstring**. In the demo the signature is `(origin: str, destination: str, date: str)` and `FlightSearchInput` is only instantiated inside the body — after the model has already chosen its arguments.
+
+The proof is in a discrepancy. With a `Field(description="IATA departure airport code, e.g. LHR")` and a docstring saying `origin: IATA departure airport code`, the generated `tool_spec` contains:
+
+```
+"origin": { "description": "IATA departure airport code", "type": "string" }
+```
+
+The `e.g. LHR` is absent — so the text came from the docstring, not the Field. Two consequences: **the docstring is where you influence the model's behaviour**, and the Pydantic model is a runtime guard that acts only after a bad call has already been made.
+
+## Strands has native structured output
+
+The lesson stops at using Pydantic inside a tool, but Strands can make the **agent itself** return a validated object:
+
+``` Python
+class TripSummary(BaseModel):
+    destination: str = Field(description="City the traveller is going to")
+    nights: int = Field(ge=1, description="Number of nights")
+    total_usd: float = Field(description="Total cost in US dollars")
+
+result = agent("Summarise: Rome, 4 nights, flight $349 plus $175 a night")
+# or explicitly:
+summary = agent.structured_output(TripSummary, "Summarise: ...")
+```
+
+Passing `structured_output_model=TripSummary` to an invocation puts the validated object in `AgentResult.structured_output`, and a failure raises `StructuredOutputException`. It works across every model provider Strands supports.
+
+**The mechanism is the interesting part: structured output _is_ function calling.** Strands converts your schema into a tool specification and the model returns data by calling that synthetic tool. So the two halves of this lesson are not alternatives — the Pydantic model, the tool schema and the structured response are all the same machinery pointed at different jobs.
+
+## Validate at both ends
+
+The demo's tool validates twice, and the second one is easy to overlook:
+
+1. **Input from the model** — catches a malformed call before the filter runs on junk.
+2. **Each record from the dataset** — `FlightOption.model_validate(fl)` inside a loop, logging and skipping bad rows rather than raising.
+
+That second check is defending against _your own data_, not the LLM. A dataset with one malformed record would otherwise take down the whole tool call, and with it the agent's turn. Skipping and logging degrades gracefully: the traveller gets four flights instead of five, and the log tells you why.
+
+> **Note:** returning `result.model_dump_json(indent=2)` rather than a dict is deliberate — a Strands tool returning a plain string has it wrapped as `{"text": ...}`, so the model receives the JSON as text it can read. Returning the Pydantic object itself would not serialise.
