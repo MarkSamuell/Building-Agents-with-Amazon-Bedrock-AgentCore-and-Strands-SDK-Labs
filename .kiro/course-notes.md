@@ -812,6 +812,33 @@ Passing `structured_output_model=TripSummary` to an invocation puts the validate
 
 **The mechanism is the interesting part: structured output _is_ function calling.** Strands converts your schema into a tool specification and the model returns data by calling that synthetic tool. So the two halves of this lesson are not alternatives — the Pydantic model, the tool schema and the structured response are all the same machinery pointed at different jobs.
 
+## `Model(**data)` or `Model.model_validate(data)`?
+
+**They run the same validation.** Verified: `HotelOption.model_validate(h) == HotelOption(**h)` is `True`, and both reject the same malformed record with the same error type. The choice is about the shape of the data in your hand, not about what is being validated or where it came from.
+
+| You are holding | Use | Because |
+| --- | --- | --- |
+| separate named values | `Model(city=city, max_price_usd=max_price_usd)` | assembling a dict just to validate it is noise |
+| one object, usually a dict | `Model.model_validate(record)` | unpacking it for Pydantic to reassemble it is noise |
+
+That is the whole reason a tool uses the constructor for the LLM's arguments — they arrive as separate function parameters — and `model_validate` for each dataset record, which is already a dict. Nothing deeper is implied by the pairing.
+
+It does also signal intent, which is worth something: `model_validate(record)` reads as _"here is untrusted data, check it"_, while the constructor reads as _"I am building one of these"_.
+
+**One real capability difference.** `model_validate` accepts keyword arguments the constructor has no equivalent for — `strict=`, `from_attributes=`, `context=` — and the first of those changes behaviour you probably care about:
+
+``` Python
+HotelOption.model_validate({**record, "price_per_night_usd": "149"})
+# -> 149.0        the string was silently coerced to a float
+
+HotelOption.model_validate({**record, "price_per_night_usd": "149"}, strict=True)
+# -> ValidationError: float_type
+```
+
+**Pydantic coerces by default**, so a `float` field accepts the string `"149"`. That has a sharp consequence for the broken-dataset exercise: the bad record is caught only because `"check website"` is not numeric. Had the data said `"149"`, the record would have been quietly _repaired_ rather than skipped, and nothing would have told you the upstream type was wrong.
+
+Which you want is a genuine decision. Lax is forgiving of sloppy upstream data, which is usually right for a JSON file you do not control. Strict is right when a type change signals a problem you would rather hear about than paper over. And `from_attributes=True` lets `model_validate` read an arbitrary object's attributes — an ORM row, say — which the constructor cannot do at all.
+
 ## Validate at both ends
 
 The demo's tool validates twice, and the second one is easy to overlook:

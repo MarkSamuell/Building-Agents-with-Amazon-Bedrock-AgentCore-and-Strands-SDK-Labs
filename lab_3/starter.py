@@ -75,25 +75,56 @@ GUIDELINES
 
 class HotelSearchInput(BaseModel):
     """Validated input for a hotel search query."""
-    # TODO (Step 2): Add the following fields using the pattern above:
-    #   - city 
-    #   - max_price_usd
+    # (Step 2) These validate what the *LLM* supplied before any filtering runs.
+    # min_length=1 matters: an empty city string would otherwise pass validation
+    # and then match nothing, which looks like "no hotels" rather than a bad call.
+    city: str = Field(
+        min_length=1,
+        description="Name of the destination city, e.g. 'Barcelona'",
+    )
+    max_price_usd: float = Field(
+        default=9999.0,
+        ge=0,
+        description="Maximum price per night in US dollars; 9999.0 means no limit",
+    )
 
 
 class HotelOption(BaseModel):
     """A single validated hotel result."""
-    # TODO (Step 3): Add the following fields using the pattern above:
-    #   - hotel_id
-    #   - name
-    #   - city
-    #   - star_rating
-    #   - price_per_night_usd
-    #   - available
-    #   - room_types
-    #   - amenities
-    #   - check_in_time
-    #   - check_out_time
-    #   - cancellation_policy
+    # (Step 3) These validate each record from the *dataset* before it leaves the
+    # tool. Every field is required on purpose -- see the note below.
+    hotel_id: str = Field(description="Hotel identifier, e.g. 'HT-BCN-002'")
+    name: str = Field(description="Hotel name, e.g. 'Barceloneta Beach Hotel'")
+    city: str = Field(description="City the hotel is in, e.g. 'Barcelona'")
+    star_rating: int = Field(
+        ge=1, le=5,
+        description="Star rating from 1 to 5",
+    )
+    price_per_night_usd: float = Field(
+        ge=0,
+        description="Price per night in US dollars, e.g. 149.0",
+    )
+    available: bool = Field(description="Whether the hotel has availability")
+    room_types: list[str] = Field(description="Room types offered, e.g. ['Standard', 'Suite']")
+    amenities: list[str] = Field(description="Amenities offered, e.g. ['Pool', 'Gym']")
+    check_in_time: str = Field(description="Check-in time in HH:MM, e.g. '15:00'")
+    check_out_time: str = Field(description="Check-out time in HH:MM, e.g. '11:00'")
+    cancellation_policy: str = Field(description="Cancellation terms in plain language")
+
+    # Deliberately NOT Optional, and deliberately no defaults.
+    #
+    # hotels_broken.json contains two malformed records, and required fields are
+    # what catch them:
+    #   HT-BCN-001  price_per_night_usd = "check website"  -> float cannot coerce it
+    #   HT-BCN-003  price_per_night_usd and star_rating absent -> "missing"
+    #
+    # Making either field Optional[...] = None would "fix" the errors by converting
+    # them into silently absent data -- a hotel with no price, presented as though
+    # it were fine. A skipped record with a log line is the better outcome.
+    #
+    # Note also that these descriptions are documentation for whoever reads the
+    # code. They do not reach the model: @tool builds the schema the LLM sees from
+    # the function signature and docstring, not from these Pydantic models.
 
 
 class HotelSearchResult(BaseModel):
@@ -177,7 +208,14 @@ async def invoke(payload, context=None):
 
     # TODO (Step 4): Create an Agent with the search_hotels tool and invoke it
 
-    pass
+    agent = Agent(
+        model=model,
+        system_prompt=SYSTEM_PROMPT,
+        tools=[search_hotels],
+    )
+
+    response = agent(user_message)
+    return response
 
 
 if __name__ == "__main__":
