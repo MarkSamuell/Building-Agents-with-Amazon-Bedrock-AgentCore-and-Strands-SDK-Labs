@@ -107,9 +107,9 @@ class HotelOption(BaseModel):
     available: bool = Field(description="Whether the hotel has availability")
     room_types: list[str] = Field(description="Room types offered, e.g. ['Standard', 'Suite']")
     amenities: list[str] = Field(description="Amenities offered, e.g. ['Pool', 'Gym']")
-    check_in_time: str = Field(description="Check-in time in HH:MM, e.g. '15:00'")
-    check_out_time: str = Field(description="Check-out time in HH:MM, e.g. '11:00'")
-    cancellation_policy: str = Field(description="Cancellation terms in plain language")
+    check_in_time: Optional[str] = Field(default=None, description="Check-in time, e.g. '15:00'")
+    check_out_time: Optional[str] = Field(default=None, description="Check-out time, e.g. '11:00'")
+    cancellation_policy: Optional[str] = Field(default=None, description="Cancellation policy description")
 
     # Deliberately NOT Optional, and deliberately no defaults.
     #
