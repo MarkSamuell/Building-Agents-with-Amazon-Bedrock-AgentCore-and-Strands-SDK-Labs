@@ -44,6 +44,15 @@ Rules for keeping it useful:
   enough to relearn the topic from this file alone. Not a summary, not an index,
   not a log of what we did. No verbosity and no redundancy either: one idea per
   paragraph, stated once.
+- **Default to recording a section as Mark gives it.** Course material that is
+  already clear goes in close to as-written. Add an example, a diagram, a table or
+  a sharper question **only where something is genuinely unclear or missing** --
+  not as a reflex on every paste. Expanding clear prose into an essay is the
+  failure mode to avoid, and it buries the parts that did need the work.
+- **Do not fact-check the course by default.** Verify only two things: an
+  assumption or claim *of your own* that is about to enter the file, and anything
+  Mark explicitly asks about or asks you to check. A whole-file fact-check happens
+  when he asks for one, not continuously.
 - **No project-tracking sections.** No verified-versus-claimed table, no traps
   list, no progress log, no open questions -- all tried and removed. AWS resources
   and cost go in sections 4 and 5 of *this* file instead.

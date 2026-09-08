@@ -889,3 +889,63 @@ The demo's tool validates twice, and the second one is easy to overlook:
 That second check is defending against _your own data_, not the LLM. A dataset with one malformed record would otherwise take down the whole tool call, and with it the agent's turn. Skipping and logging degrades gracefully: the traveller gets four flights instead of five, and the log tells you why.
 
 > **Note:** returning `result.model_dump_json(indent=2)` rather than a dict is deliberate — a Strands tool returning a plain string has it wrapped as `{"text": ...}`, so the model receives the JSON as text it can read. Returning the Pydantic object itself would not serialise.
+
+# Short-Term Memory
+
+A language model has no memory. Every call is the first call. What looks like continuity is the framework **re-sending the conversation** on every turn — the agent is not remembering, it is being reminded, at full token cost, each time.
+
+This is easy to see rather than take on trust. An agent built fresh inside its request handler, with memory disabled, answers _"and what about 5 nights?"_ by asking which hotel you mean. Nothing carried over, because nothing was re-sent.
+
+## The three strategies, and what Strands calls them
+
+The trade is always the same: context fidelity against tokens. Strands ships a class for each option, and one of them is already switched on whether you asked for it or not.
+
+| Strategy | What it does | Strands | Cost |
+| --- | --- | --- | --- |
+| **Full history** | send every message every turn | no manager — you opt out of reduction | grows without bound; eventually overflows the context window |
+| **Sliding window** | keep the most recent N exchanges | `SlidingWindowConversationManager` — **the default** | bounded, but older context is gone permanently |
+| **Summarisation** | condense older messages into a précis | `SummarizingConversationManager` | bounded and retains the gist, at the price of an extra model call and lossy detail |
+
+**The default matters.** `SlidingWindowConversationManager` is applied even when you never mention a conversation manager, so every agent in these labs already discards old turns once the window fills. The window is measured in _message pairs_:
+
+``` Python
+from strands.agent.conversation_manager import SlidingWindowConversationManager
+
+agent = Agent(
+    conversation_manager=SlidingWindowConversationManager(
+        window_size=10,   # message pairs to keep
+        pin_first=1,      # never evict the first message
+    )
+)
+```
+
+`pin_first` is worth knowing: it protects the opening messages from eviction, which is how you stop a sliding window throwing away the turn that established what the whole conversation is about. The pin is written during the first reduction and stays set.
+
+## What is "state", exactly?
+
+The course splits this two ways — transient state versus session memory. Strands splits it **three** ways, and the finer taxonomy is more useful:
+
+| | What it holds | Lifetime | Does the model see it? |
+| --- | --- | --- | --- |
+| **Conversation history** | the messages, in `agent.messages` | the conversation | **yes** — it *is* the prompt |
+| **Agent state** | arbitrary data outside the conversation | across requests | **no** |
+| **Invocation state** | context within a single invocation | one turn | no |
+
+**The distinction that matters is not duration, it is whether the model sees it.** Conversation history is memory precisely because it is re-sent; agent state is deliberately *not* re-sent, which is what makes it the right place for a user id, a feature flag or a running counter — data your code needs and the model has no business reading, and which costs no tokens.
+
+`Agent(state=...)` takes an `AgentState` or any JSON-serialisable dict, and `agent_id` names the agent for session management.
+
+## Is short-term memory ephemeral?
+
+**Not necessarily** — scope and storage are independent axes, and the course pairs them. AgentCore Memory's short-term memory stores raw events server-side: it survives a restart, and a user can return later and resume the same `sessionId`. Short-term in _scope_, durable in _storage_.
+
+| | AgentCore short-term | AgentCore long-term |
+| --- | --- | --- |
+| Holds | raw events: messages, tool calls | extracted insights |
+| Built by | `CreateEvent` per interaction | strategies: semantic, summarisation, user preference, episodic, or custom |
+| Read by | `ListEvents`, `GetEvent`, `ListSessions` | semantic search across sessions |
+| Scope | one session | all of an actor's sessions |
+
+Both are scoped by **`actorId` + `sessionId`**.
+
+> **Note:** getting `actorId` wrong leaks conversations between users. With memory enabled and no actor distinction, every conversation shares one memory — observed on a previous project, where a brand-new session was told details had "already" been provided and was handed an identifier created in someone else's conversation. Pass a fresh actor per conversation for isolation, or a stable one deliberately when a returning user should be remembered.
