@@ -949,3 +949,214 @@ The course splits this two ways — transient state versus session memory. Stran
 Both are scoped by **`actorId` + `sessionId`**.
 
 > **Note:** getting `actorId` wrong leaks conversations between users. With memory enabled and no actor distinction, every conversation shares one memory — observed on a previous project, where a brand-new session was told details had "already" been provided and was handed an identifier created in someone else's conversation. Pass a fresh actor per conversation for isolation, or a stable one deliberately when a returning user should be remembered.
+
+# What Is AgentCore Memory?
+
+**Memory is its own AWS resource, created before and independently of any agent.** You create it once, keep the **memory ID** it returns, and hand that id to whatever code needs it. One resource can serve many agents, actors and sessions — nothing about it is per-agent.
+
+Creation is asynchronous and takes a couple of minutes to reach `ACTIVE`, which is why the client offers a blocking variant:
+
+``` Python
+# pip install bedrock-agentcore
+# =====================================================
+# CREATING THE MEMORY RESOURCE - run once, before the agent
+# =====================================================
+from bedrock_agentcore.memory import MemoryClient
+
+client = MemoryClient(region_name="us-east-1")
+
+memory = client.create_memory_and_wait(   # the _and_wait variant polls until ACTIVE
+    name="WanderBot",
+    strategies=[],           # no strategies -> short-term only
+    event_expiry_days=7,     # how long raw events are retained; the SDK default is 90
+)
+print(memory.get("id"))      # this string is the MEMORY_ID the agent needs
+```
+
+## `strategies` is the switch between the two layers
+
+Short-term and long-term are not two services; they are two halves of one resource, and the `strategies` list decides which halves are live. An empty list stores raw events and does nothing further with them. Add a strategy and the _same_ events additionally feed an extraction pipeline.
+
+The halves differ in _when_ they are written, and that is the practical catch. Short-term is synchronous — `create_event` returns and the event is durably stored. Long-term extraction is asynchronous and runs well behind the conversation: the SDK ships `wait_for_memories` purely to poll until it has caught up, and that method's own docstring recommends `time.sleep(150)` — two and a half minutes — for the cases where polling is unreliable. Long-term memory is therefore _eventually_ consistent, and an insight drawn from the current turn is not something the next turn can rely on.
+
+## Strategies and namespaces
+
+A **strategy** is the rule for converting raw conversation into durable insight, and comes in four ready-made families — semantic, summary, user preference and episodic — plus custom variants where you supply the extraction and consolidation configuration yourself.
+
+Each strategy writes into a **namespace**: a slash-separated path fixed when the strategy is created, with `{actorId}`, `{sessionId}` and `{memoryStrategyId}` available as template variables. **The path is the retrieval scope**, which makes it a design decision rather than a label — `/strategy/{memoryStrategyId}/actor/{actorId}/session/{sessionId}/` confines insights to a single conversation, while dropping the session segment exposes them across every conversation that actor has ever had. Retrieval names the namespace directly, `retrieve_memories(namespace=..., query=..., top_k=...)`, with a `namespace_path` prefix form for reading a whole subtree. Namespaces are long-term only: short-term is always keyed by actor plus session, with no path involved.
+
+## Events are immutable and append-only
+
+Everything short-term memory holds is an **event**, appended and never edited. Conversational events carry `(text, ROLE)` pairs with the role `USER`, `ASSISTANT` or `TOOL`; blob events carry an arbitrary payload instead, which is where an agent checkpoint or serialised state would go rather than dialogue. Both are keyed by `memoryId` + `actorId` + `sessionId`, and `event_expiry_days` on the resource sets how long they survive.
+
+> **Note:** the launch blog states that only conversational events feed long-term extraction. That is not repeated in the API reference, so treat it as probable rather than settled.
+
+# Wiring Short-Term Memory Into the Agent
+
+A planning conversation arrives in pieces — destination in one message, dates in the next, party size after that. Without memory every invocation is stateless and the traveller has to repeat themselves. The fix is **session-scoped short-term memory**, backed by AgentCore Memory and wired in through the Strands hook system.
+
+## First, a memory resource
+
+Memory is a resource you create before any code runs, either in the AgentCore console's memory section — name it, choose a short-term expiry, create — or from the CLI:
+
+```bash
+agentcore memory create --name wanderbot-memory
+```
+
+It takes a couple of minutes. Take the **memory ID** from the output and put it in your code.
+
+## What is a hook, underneath?
+
+**A hook is a callback the agent invokes at a named point in its own run loop.** Strands publishes _event objects_ at fixed moments — invocation start and end, before and after each model call, before and after each tool call, a message being appended, construction finishing — and you subscribe by registering a callback against the event _class_. Version 1.53 exports fifteen event types; short-term memory uses two of them. Request logging, tool-call auditing and guardrails are this same mechanism aimed at different events.
+
+The design goal is composition: behaviour is added from _outside_ the agent, with no subclassing of `Agent` and no fork of the SDK.
+
+| Piece | What it actually is |
+| --- | --- |
+| **`HookProvider`** | A `@runtime_checkable` _protocol_ rather than a base class — its sole requirement is a `register_hooks(self, registry, **kwargs)` method, and inheriting from it is optional. What it earns you is a home for several related callbacks _and_ the state they share, here the memory client, the memory id and `last_k_turns` |
+| **`HookRegistry`** | The agent's own switchboard, reachable afterwards as `agent.hooks`. You never construct one; it arrives as the argument to `register_hooks`. `add_hook(provider)` does nothing but call `provider.register_hooks(registry)` straight back, while `add_callback(EventType, fn, order=0)` does the real subscribing, keeping one callback list per event type sorted by `order`, lowest first |
+
+**Your callbacks queue alongside the framework's own.** During construction the agent registers its conversation manager, retry strategy and session manager on that same registry — `SlidingWindowConversationManager` from the previous topic is itself a `HookProvider`, and does its compression from a `BeforeModelCallEvent` callback. Hooks are not a bolt-on for user code; they are how Strands is wired internally.
+
+## Two lifecycle events do all the work
+
+| Event | Fires | Does |
+| --- | --- | --- |
+| `AgentInitializedEvent` | once per invocation, before the first model call | loads the last _k_ turns from memory and injects them into the system prompt |
+| `MessageAddedEvent` | every time a message is added, user **and** assistant | persists that message with `memory_client.create_event` |
+
+``` Python
+from strands.hooks import (
+    AgentInitializedEvent,   # fires once per invocation, before the first model call
+    HookProvider,            # protocol you implement: one method, register_hooks
+    HookRegistry,            # what you attach callbacks to
+    MessageAddedEvent,       # fires on every message appended to the conversation
+)
+
+
+class ShortTermMemoryHookProvider(HookProvider):
+    def __init__(self, memory_client, memory_id, last_k_turns=5):
+        self.memory_client = memory_client   # bedrock_agentcore.memory client
+        self.memory_id = memory_id           # the resource id from `agentcore memory create`
+        self.last_k_turns = last_k_turns     # how much history to replay; more turns = more tokens
+
+    def register_hooks(self, registry: HookRegistry) -> None:
+        # The one method HookProvider requires. It declares which lifecycle events
+        # you want and which of your methods handles each. Strands calls them; you
+        # never invoke these yourself -- same registration pattern as @app.entrypoint.
+        registry.add_callback(AgentInitializedEvent, self.on_agent_initialized)
+        registry.add_callback(MessageAddedEvent, self.on_message_added)
+
+    # ---- READ PATH: once, at the start of an invocation ----------------------
+    def on_agent_initialized(self, event: AgentInitializedEvent) -> None:
+        # Both ids live in agent.state, put there by the entrypoint.
+        actor_id = event.agent.state.get("actor_id")
+        session_id = event.agent.state.get("session_id")
+        if not actor_id or not session_id:
+            return          # no ids -> no memory, but the agent still works
+
+        # Ask AgentCore Memory for this session's recent history. Returns a list of
+        # turns, where each turn is itself a list of messages.
+        recent_turns = self.memory_client.get_last_k_turns(
+            memory_id=self.memory_id,
+            actor_id=actor_id,
+            session_id=session_id,
+            k=self.last_k_turns,
+        )
+        if not recent_turns:
+            return          # first turn of a new session: nothing to replay
+
+        # Flatten the nested turns into plain "Role: text" lines.
+        lines = []
+        for turn in recent_turns:
+            for m in turn:
+                role = m.get("role", "unknown").capitalize()
+                text = m.get("content", {}).get("text", "")
+                if text:
+                    lines.append(f"{role}: {text}")
+        if lines:
+            # This is the whole trick: history reaches the model as extra system
+            # prompt. Nothing is "remembered" -- the prompt is simply longer.
+            event.agent.system_prompt += "\n\nRecent conversation:\n" + "\n".join(lines)
+
+    # ---- WRITE PATH: every message, user and assistant -----------------------
+    def on_message_added(self, event: MessageAddedEvent) -> None:
+        actor_id = event.agent.state.get("actor_id")
+        session_id = event.agent.state.get("session_id")
+        if not actor_id or not session_id:
+            return
+
+        # Messages carry a list of content blocks; pull the text out of the first.
+        message = event.message
+        content = message.get("content", [])
+        text = content[0].get("text") if content and isinstance(content[0], dict) else None
+        if not text:
+            return          # tool-use blocks and the like have no text to store
+
+        # One event per message, keyed by actor + session. `messages` takes
+        # (text, ROLE) tuples, with the role upper-cased.
+        self.memory_client.create_event(
+            memory_id=self.memory_id,
+            actor_id=actor_id,
+            session_id=session_id,
+            messages=[(text, message.get("role", "").upper())],
+        )
+```
+
+## Where the two events are fired from, exactly
+
+| Event | Emitted from | Called |
+| --- | --- | --- |
+| **`AgentInitializedEvent`** | the _last line_ of `Agent.__init__` | synchronously |
+| **`MessageAddedEvent`** | `Agent._append_messages`, once per message appended | asynchronously |
+
+The first location is what makes the read path safe: the constructor has finished assembling everything, yet no model call has happened, so `system_prompt` is still unsent and rewriting it costs nothing. It also means the read runs during `Agent(...)` rather than during `agent(user_message)` — build the agent twice in one request and history is replayed twice.
+
+> **Note:** an `AgentInitializedEvent` callback **must be synchronous**. `add_callback` raises `ValueError: AgentInitializedEvent can only be registered with a synchronous callback` when handed an `async def`. That is why `on_agent_initialized` is a plain `def` in a file whose entrypoint is `async`.
+
+The second location is why the write path bails out quietly when it finds no text: it fires for _every_ appended message, and an assistant message asking for a tool carries a tool-use block rather than prose. Only messages appended by the framework fire it at all, so anything a tool pushes into `agent.messages` by hand is never persisted.
+
+## Why the hook can rewrite the system prompt
+
+Hook events are frozen in all but name: their base class overrides `__setattr__` to raise `AttributeError` for any property not explicitly marked writable, so `event.message = something` fails outright. `event.agent.system_prompt += ...` succeeds because it never touches the event — it reaches _through_ it to the agent the event merely holds a reference to. An event is a notification with a pointer attached, not a mutable payload.
+
+## The two paths, and why the ordering matters
+
+```
+  INVOCATION 1  (session_id = S)                    AgentCore Memory
+  ────────────────────────────────                  ────────────────
+  AgentInitializedEvent
+    └─ get_last_k_turns(S) ──────────────────────►  (nothing yet)
+       system_prompt unchanged
+
+    user: "Alice is planning a trip to Rome"
+      └─ MessageAddedEvent
+           └─ create_event ────────────────────────►  USER      "Alice is…"
+    assistant: "Lovely — when are you travelling?"
+      └─ MessageAddedEvent
+           └─ create_event ────────────────────────►  ASSISTANT "Lovely — …"
+
+  INVOCATION 2  (same session_id = S)
+  ────────────────────────────────
+  AgentInitializedEvent
+    └─ get_last_k_turns(S) ──────────────────────►  reads both back
+       system_prompt += "Recent conversation: …" ◄──┘
+
+    user: "which one is the cheapest?"                 <- now resolvable
+      └─ MessageAddedEvent
+           └─ create_event ────────────────────────►  USER      "which one…"
+```
+
+The asymmetry is the point: **the read happens once, at the start of an invocation; the write happens on every message.** So memory does nothing to help *within* a single invocation — Strands' own message list already carries that. What memory buys is the bridge *between* invocations, which is exactly where a stateless agent forgets.
+
+That also explains the failure mode from earlier labs. Rebuilding the `Agent` inside the handler wipes the message list every request; memory restores it from outside, so the same follow-up question that previously drew a blank now resolves.
+
+The entrypoint stays thin — it builds the agent with `hooks=[...]` and `state={"session_id": ..., "actor_id": ...}` and nothing else. `session_id` comes from `context`, which AgentCore supplies automatically and which every invocation in the same session shares. `actor_id` comes from the payload, so you pass it in. Both go into `agent.state`, which is how the hook provider reads them.
+
+## Configure with memory enabled
+
+At `agentcore configure`, **do not** pass `--disable-memory` — answer the memory prompt and select the memory resource. Running interactively rather than with `--non-interactive` is what lets you do that.
+
+## Proving it works by taking it away
+
+The demonstration is worth repeating: ask for flights, then run `agentcore stop-session` and ask _"which one is the cheapest?"_. With the session gone the agent has no context and starts asking for origin and destination again. Re-run the flight search in a fresh session, ask the same follow-up, and it answers correctly. Same code, same question — the only variable is whether the session's memory exists.

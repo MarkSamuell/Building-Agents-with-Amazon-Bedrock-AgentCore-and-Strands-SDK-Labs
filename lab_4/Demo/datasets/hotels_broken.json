@@ -1,0 +1,52 @@
+[
+  {
+    "hotel_id": "HT-BCN-001",
+    "name": "Hotel Casa Marina",
+    "city": "Barcelona",
+    "star_rating": 4,
+    "price_per_night_usd": "check website",
+    "available": true,
+    "room_types": ["Standard", "Deluxe", "Suite"],
+    "amenities": ["Pool", "Spa", "Restaurant", "Gym"],
+    "check_in_time": "15:00",
+    "check_out_time": "11:00",
+    "cancellation_policy": "Free cancellation up to 24h before check-in"
+  },
+  {
+    "hotel_id": "HT-BCN-002",
+    "name": "Barceloneta Beach Hotel",
+    "city": "Barcelona",
+    "star_rating": 3,
+    "price_per_night_usd": 149.00,
+    "available": true,
+    "room_types": ["Standard", "Sea View"],
+    "amenities": ["Pool", "Bar", "Free WiFi"],
+    "check_in_time": "14:00",
+    "check_out_time": "10:00",
+    "cancellation_policy": "Non-refundable"
+  },
+  {
+    "hotel_id": "HT-BCN-003",
+    "name": "Gothic Quarter Inn",
+    "city": "Barcelona",
+    "available": true,
+    "room_types": ["Standard"],
+    "amenities": ["Free WiFi", "Breakfast"],
+    "check_in_time": "16:00",
+    "check_out_time": "11:00",
+    "cancellation_policy": "Free cancellation up to 48h before check-in"
+  },
+  {
+    "hotel_id": "HT-TYO-001",
+    "name": "Tokyo Imperial Garden Hotel",
+    "city": "Tokyo",
+    "star_rating": 5,
+    "price_per_night_usd": 420.00,
+    "available": true,
+    "room_types": ["Deluxe", "Suite", "Presidential"],
+    "amenities": ["Spa", "Restaurant", "Concierge", "Gym", "Pool"],
+    "check_in_time": "15:00",
+    "check_out_time": "12:00",
+    "cancellation_policy": "Free cancellation up to 72h before check-in"
+  }
+]
