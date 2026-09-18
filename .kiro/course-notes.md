@@ -903,23 +903,25 @@ The trade is always the same: context fidelity against tokens. Strands ships a c
 | Strategy | What it does | Strands | Cost |
 | --- | --- | --- | --- |
 | **Full history** | send every message every turn | no manager — you opt out of reduction | grows without bound; eventually overflows the context window |
-| **Sliding window** | keep the most recent N exchanges | `SlidingWindowConversationManager` — **the default** | bounded, but older context is gone permanently |
+| **Sliding window** | keep the most recent N messages | `SlidingWindowConversationManager` — **the default** | bounded, but older context is gone permanently |
 | **Summarisation** | condense older messages into a précis | `SummarizingConversationManager` | bounded and retains the gist, at the price of an extra model call and lossy detail |
 
-**The default matters.** `SlidingWindowConversationManager` is applied even when you never mention a conversation manager, so every agent in these labs already discards old turns once the window fills. The window is measured in _message pairs_:
+**The default matters.** `SlidingWindowConversationManager` is applied even when you never mention a conversation manager, so every agent in these labs already discards old turns once the window fills. The window is measured in _messages_ — not turns, and not exchanges — and defaults to 40. Since a turn that calls a tool expands into four messages, that default is nearer ten tool-using turns than forty of anything:
 
 ``` Python
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 agent = Agent(
     conversation_manager=SlidingWindowConversationManager(
-        window_size=10,   # message pairs to keep
+        window_size=10,   # messages to keep; the default is 40
         pin_first=1,      # never evict the first message
     )
 )
 ```
 
-`pin_first` is worth knowing: it protects the opening messages from eviction, which is how you stop a sliding window throwing away the turn that established what the whole conversation is about. The pin is written during the first reduction and stays set.
+`pin_first` is worth knowing: it protects the opening messages from eviction, which is how you stop a sliding window throwing away the turn that established what the whole conversation is about. The pin is written during the first reduction and stays set. **Pinned messages sit outside the window budget rather than inside it**: `window_size=6` with `pin_first=2` leaves eight messages — the two pinned, plus a full six-message window. So `pin_first` raises the ceiling instead of spending part of it, which matters when sizing a window against a context limit.
+
+**Reduction runs at the end of an invocation rather than before the model call**, because `per_turn` defaults to `False`. That produces a result which looks contradictory at first: a turn can answer correctly from context that is evicted moments later, so the model saw more than the surviving history shows. `per_turn=True` reduces before every model call instead, which is what you want for an agent making many tool calls in a loop.
 
 ## What is "state", exactly?
 
