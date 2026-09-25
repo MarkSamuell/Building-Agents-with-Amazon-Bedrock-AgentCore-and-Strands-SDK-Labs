@@ -180,6 +180,16 @@ So the rule is: run `destroy` first, then enumerate AWS and mop up. Do not treat
 
 **What the whole experiment actually cost: $0.0612**, measured via Cost Explorer, and paid by Vocareum. Breakdown: CodeBuild $0.0560, Bedrock $0.0039, CloudWatch $0.0012, S3 $0.0001, CloudWatch Events $0.00002. **CodeBuild was 92% of it despite every build being killed within 1-4 seconds** -- builds bill in rounded-up minutes, so a build stopped at two seconds costs the same as one that ran for a minute. ECR never appeared as a line item at all, confirming no image was ever pushed.
 
+**Live now, and deliberately left running.** `lab_4/Demo/demo.ipynb` Part B created an AgentCore Memory
+resource named **`WanderBotNotebook`** in us-east-1 on 2026-09-25 — short-term only (`strategies=[]`,
+`event_expiry_days=7`), holding roughly 13 events across actors `direct-probe`, `alice-live` and `bob-live`.
+**Not torn down**, because Mark is keeping it for the lab itself rather than only the demo. The id suffix is
+deliberately not recorded here since this repo is public; a later session can find it with
+`MemoryClient.list_memories()` or just call `create_or_get_memory(name="WanderBotNotebook")`, which reuses it.
+Cost so far is about $0.003, at $0.25 per 1,000 short-term events, billed to Vocareum. Raw events self-expire
+after 7 days but **the resource itself persists until deleted** — teardown is Step 10 of the notebook
+(`delete_memory_and_wait`, then verify with `list_memories`).
+
 ## 6. Status
 
 | Item | State |
