@@ -26,14 +26,25 @@ logging.basicConfig(
 logger = logging.getLogger("WanderBot.ShortTermMemory")
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "datasets"
+
+# The dataset normally sits beside this file. The Demo folder is checked as a
+# fallback so the script still runs when only that copy is present.
+CANDIDATE_DATA_DIRS = [BASE_DIR / "datasets", BASE_DIR / "Demo" / "datasets"]
+DATA_DIR = next(
+    (path for path in CANDIDATE_DATA_DIRS if (path / "hotels.json").is_file()),
+    BASE_DIR / "datasets",
+)
 
 app = BedrockAgentCoreApp()
 
-MODEL_ID = "us.amazon.nova-2-lite-v1:0"
-model = BedrockModel(model_id=MODEL_ID)
-
 REGION = "us-east-1"
+
+MODEL_ID = "us.amazon.nova-2-lite-v1:0"
+# region_name is passed explicitly so the model and MemoryClient cannot end up in
+# different regions: without it, BedrockModel falls back to the boto3 session's
+# region, then AWS_REGION, then its own default.
+model = BedrockModel(model_id=MODEL_ID, region_name=REGION)
+
 MEMORY_ID = "WanderBotNotebook-rlbXwr6VkG"  # TODO: Set this to your Memory ID from agentcore memory create
 
 SYSTEM_PROMPT = """You are WanderBot, the AI travel assistant for Horizon Travel.
@@ -139,13 +150,24 @@ class ShortTermMemoryHookProvider(HookProvider):
         if not recent_turns:
             return
 
-        lines = []
+        # get_last_k_turns returns turns NEWEST-first, and its grouping heuristic
+        # (a USER message opens a new turn) is only valid on a chronological
+        # stream. Fed its own newest-first output it pairs each question with the
+        # PREVIOUS answer, so reversing the turns is not enough - it would yield
+        # every question followed by every answer. Discard the grouping instead:
+        # flatten to messages, then reverse, which restores real chronology.
+        flat_messages = []
         for turn in recent_turns:
             for message in turn:
-                role = message.get("role", "unknown").capitalize()
-                text = message.get("content", {}).get("text", "")
-                if text:
-                    lines.append(f"{role}: {text}")
+                flat_messages.append(message)
+        flat_messages.reverse()
+
+        lines = []
+        for message in flat_messages:
+            role = message.get("role", "unknown").capitalize()
+            text = message.get("content", {}).get("text", "")
+            if text:
+                lines.append(f"{role}: {text}")
 
         if lines:
             context = "\n".join(lines)
@@ -181,9 +203,53 @@ class ShortTermMemoryHookProvider(HookProvider):
 # ===========================================================================
 # ENTRY POINT
 # ===========================================================================
+# Why `async def` here - and what it does and does not buy.
+#
+# AgentCore Runtime accepts either form. Its dispatcher, BedrockAgentCoreApp
+# ._invoke_handler, documents three cases: async generators are bridged through a
+# worker loop, regular async functions run ON a dedicated worker event loop, and
+# sync functions are handed to a thread pool - "so the main event loop stays
+# responsive for /ping health checks regardless of whether handlers contain
+# blocking operations". So async is optional, not a requirement of the decorator.
+#
+# What async genuinely buys is the ability to `await`: several tool calls, a memory
+# read and another service call can overlap inside one invocation without tying up
+# a thread.
+#
+# This function never awaits anything. `agent(user_message)` is synchronous, and
+# Agent.__call__ internally calls run_async(), which starts a ThreadPoolExecutor
+# thread, runs asyncio.run() inside it, and blocks on future.result(). So declaring
+# the entrypoint async schedules it on the shared worker event loop and then blocks
+# that loop for the entire agent run - an extra thread and an extra event loop, for
+# no concurrency gained.
+#
+# Two coherent shapes, and this file is currently neither of them:
+#
+#   def invoke(payload, context=None):          # the runtime gives it a thread,
+#       response = agent(user_message)          # where blocking is expected
+#
+#   async def invoke(payload, context=None):    # genuinely async: nothing blocks
+#       response = await agent.invoke_async(user_message)
+#
+# One wrinkle applies either way. Constructing the Agent fires
+# AgentInitializedEvent, whose callback must be synchronous - so the AgentCore
+# Memory read in on_agent_initialized is a blocking network call made while the
+# agent is being built, before any of the above takes effect.
 
 @app.entrypoint
 async def invoke(payload: dict, context=None) -> dict:
+    """Handle one AgentCore Runtime invocation.
+
+    Args:
+        payload: The caller's JSON body, already parsed to a dict. Reads "message"
+            and optionally "actor_id".
+        context: Runtime-supplied request metadata. context.session_id identifies
+            the conversation and is shared by every invocation in the same session,
+            which is what makes memory lookups line up across calls.
+
+    Returns:
+        The agent's result, which AgentCore serialises into the HTTP response.
+    """
     user_message = payload.get("message", "Hello!")
     session_id = context.session_id
     actor_id = payload.get("actor_id", "wanderbot-user")
