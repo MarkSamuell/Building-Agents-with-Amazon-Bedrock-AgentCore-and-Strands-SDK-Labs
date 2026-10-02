@@ -1162,3 +1162,181 @@ At `agentcore configure`, **do not** pass `--disable-memory` — answer the memo
 ## Proving it works by taking it away
 
 The demonstration is worth repeating: ask for flights, then run `agentcore stop-session` and ask _"which one is the cheapest?"_. With the session gone the agent has no context and starts asking for origin and destination again. Re-run the flight search in a fresh session, ask the same follow-up, and it answers correctly. Same code, same question — the only variable is whether the session's memory exists.
+
+## Key takeaways
+
+- `HookProvider` is the extension point for the Strands agent lifecycle. Subclass it, implement `register_hooks()`, and bind callbacks to the events you care about.
+
+- `AgentInitializedEvent` fires once per invocation — the right place to load prior turns from AgentCore Memory and inject them into the system prompt.
+
+- `MessageAddedEvent` fires on every new message — the right place to call memory_client.create_event so user and assistant text is persisted turn by turn.
+
+- `agent.state` is how session identity reaches hooks. Pass state={"session_id": ..., "actor_id": ...} on the Agent and read it with event.agent.state.get(...).
+
+- Session memory is scoped by session_id, and by user. A traveller with multiple planning sessions gets separate contexts without cross-contamination.
+
+- The entrypoint stays tiny. Once the hook provider is attached, persistence and context injection happen automatically — no orchestration code is required.
+
+
+# From Local Tools to Managed APIs
+
+Every tool so far was a `@tool` function inside the agent's own source. That is right for development and wrong for production, for reasons that have nothing to do with the model: the tool shares the agent's deployment, its runtime, its dependencies and its permissions, and the data it reaches — Horizon's bookings — lives in another system anyway. A `@tool` that calls that system is just a client with the agent's release schedule bolted on.
+
+The production shape is to run the tool as its own service and put something between the agent and the service that both sides understand. In AgentCore that something is the **Gateway**.
+
+## What is AgentCore Gateway?
+
+**AgentCore Gateway** is a managed MCP server that fronts your existing services — Lambda functions, REST APIs, other MCP endpoints — and presents them to an agent as tools. It does two jobs: it _translates_ an MCP tool call into an invocation of the thing behind it, and it _advertises_ which tools exist, so the agent discovers them instead of carrying their definitions in code.
+
+**MCP (Model Context Protocol)** is the open protocol that standardises how an agent talks to tool servers: a client connects, asks the server to list its tools (name, description, parameter schema), and calls them by name. The agent side is an MCP _client_; the Gateway is an MCP _server_. Nothing behind the Gateway needs to know MCP exists.
+
+| | Local `@tool` | Gateway tool |
+| --- | --- | --- |
+| **Where the code runs** | inside the agent's process | in a Lambda (or other target) |
+| **Where the schema comes from** | generated from signature + docstring | written by hand, registered on the target |
+| **How the agent learns about it** | imported in code | discovered at runtime over MCP |
+| **Deployed with** | the agent | independently |
+
+## The flow, end to end
+
+```
+WanderBot (Strands Agent)
+    |  MCP over streamable HTTP   -- list tools, then call one
+AgentCore Gateway
+    |  direct Lambda invocation   -- no API Gateway, no HTTP routing
+booking_lambda.py
+    |  handler routes on the tool name the Gateway supplies
+get_booking() / list_bookings_by_email()
+```
+
+Two things are notable by their absence. There is no API Gateway and no web framework in the Lambda: the Gateway invokes the function directly, so the handler receives plain parameters and returns a result. And there is no tool code in the agent: it holds a URL and a system prompt, nothing else.
+
+## The Lambda behind the Gateway
+
+The Lambda is ordinary Python: hard-coded sample data, two functions (`get_booking` by reference, `list_bookings_by_email` by address), and a handler. The one Gateway-specific line is how the handler learns _which_ tool was called. The Gateway invokes a single function for every tool on the target, and names the intended tool in the invocation's client context:
+
+``` Python
+raw_tool = context.client_context.custom.get("bedrockAgentCoreToolName", "")
+tool = raw_tool.split("___", 1)[-1] if "___" in raw_tool else raw_tool
+```
+
+The handler expects the name prefixed by the target name and three underscores — `booking-target___get_booking` — and keeps the part after the separator. That is the whole dispatch: one Lambda, several tools, routed by a string the Gateway sets. The fallback branch (infer the tool from the event's keys when there is no client context) is what keeps a plain `aws lambda invoke` working for local testing.
+
+## What does the schema file contribute?
+
+The Gateway runs in a different process from the function, so it cannot introspect a signature or read a docstring. The **schema** is how you tell it what the Lambda offers: a list of tool definitions, each with a `name`, a `description` the model reads when choosing tools, and an `inputSchema` — JSON Schema for the parameters, which the Gateway also uses to validate what the model sends. You register it when adding the Lambda as a target.
+
+Set a Gateway tool definition beside a `@tool`'s generated `tool_spec` and they have the **same three keys**: `name`, `description`, `inputSchema`. The decorator generated that contract from code; for a Gateway tool you author it by hand. Same contract, different author — which is why the model experiences no difference between them.
+
+## Connecting from the agent
+
+``` Python
+# pip install strands-agents mcp
+# =====================================================
+# AGENT SIDE - discover tools, then use them, in one session
+# =====================================================
+from strands import Agent
+from strands.tools.mcp.mcp_client import MCPClient
+from mcp.client.streamable_http import streamable_http_client
+
+GATEWAY_ENDPOINT = "https://<gateway-url>/mcp"
+
+# 1. A transport FACTORY, not a connection. The lambda is a recipe the client
+#    calls later; constructing MCPClient opens nothing.
+client = MCPClient(lambda: streamable_http_client(url=GATEWAY_ENDPOINT))
+
+# 2. Entering the block is where networking starts: a background thread opens
+#    the transport and completes the MCP handshake before the body runs.
+with client:
+    # 3. Ask the server for every registered tool. Each comes back as a
+    #    Strands-compatible tool object built from the Gateway's schema.
+    tools = client.list_tools_sync()
+
+    # 4. Same constructor as always. No @tool anywhere.
+    agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools)
+
+    # 5. Invoke INSIDE the block - remote tools call back through this client.
+    response = agent(user_message)
+# 6. Leaving the block closes the session and the thread, even on an exception.
+```
+
+> **Note:** `MCPClient(url=GATEWAY_ENDPOINT)` is accepted as a shortcut and builds the streamable HTTP transport for you. The lambda form is the general one — it is how you would plug in any other MCP transport.
+
+## Why can the agent not tell a local tool from a remote one?
+
+Because they are the same type as far as `Agent` is concerned. `list_tools_sync()` wraps each MCP tool definition as an `MCPAgentTool`; a `@tool` function becomes a `DecoratedFunctionTool`. Both subclass Strands' `AgentTool`, and `Agent(tools=...)` asks every tool for the same three things — a name, a spec, a way to invoke it. The model is handed names and schemas either way. Where execution happens — in-process, across MCP to a Gateway, inside a Lambda — sits entirely below that boundary.
+
+## What the `with` block owns
+
+**The context manager is the session, not a convenience.** `MCPClient` does nothing at construction. `__enter__` starts a background thread, opens the transport, runs MCP initialisation and _blocks_ until the server is ready or `startup_timeout` (30 s by default) expires. `__exit__` tears all of it down.
+
+Two consequences follow, and both bite:
+
+- Call `list_tools_sync()` before entering the block and it refuses locally with `MCPClientInitializationError: the client session is not running` — no request is ever sent.
+- Do not return `tools` out of the block and invoke the agent afterwards. An `MCPAgentTool` executes by calling back through its `MCPClient`, and that client has been stopped. Discovery and use share one session lifetime.
+
+> **Note:** `mcp` ships both `streamable_http_client` and `streamablehttp_client`, and they are _different functions_ with different parameters, not alternative spellings of one. The course uses `streamable_http_client`; do not swap in the other on the assumption they are aliases.
+
+## How do you know an endpoint speaks MCP at all?
+
+You cannot tell from the URL. The protocol has no discovery endpoint and no "are you MCP?" probe; a server proves it speaks MCP by **answering the first message correctly**. That first message is the handshake, and `with client:` is nothing more than the SDK performing it for you.
+
+**The handshake is JSON-RPC 2.0 over HTTP.** The client POSTs an `initialize` request naming its protocol version, capabilities and identity:
+
+```bash
+curl -s -i -X POST https://<endpoint>/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize",
+           "params":{"protocolVersion":"2025-11-25","capabilities":{},
+                     "clientInfo":{"name":"probe","version":"0.1"}}}'
+```
+
+An MCP server answers with a JSON-RPC _result_ carrying three required fields — its own `protocolVersion`, its `capabilities`, and `serverInfo` — plus a session header the client must echo on every later request. This is a real reply from a one-tool test server:
+
+```json
+HTTP/1.1 200 OK
+content-type: application/json
+mcp-session-id: <id>
+
+{"jsonrpc":"2.0","id":1,
+ "result":{"protocolVersion":"2025-11-25",
+           "capabilities":{"tools":{"listChanged":false}, "prompts":{...}, "resources":{...}},
+           "serverInfo":{"name":"probe-server","version":"1.29.1"}}}
+```
+
+The same request to a plain web server on another port returned `501 Unsupported method ('POST')` and an HTML error page. That is the whole test: a JSON-RPC result with those three fields means MCP; a 404, HTML, or JSON that is not a JSON-RPC result means not MCP, or not at that path.
+
+**Then `tools/list` tells you it is a _tool_ server.** After `initialize`, the client sends a `notifications/initialized` notification and can start making requests. `tools/list` on the test server returned:
+
+```json
+{"jsonrpc":"2.0","id":2,
+ "result":{"tools":[{"name":"ping",
+                     "description":"Reply with a greeting, to prove a tool call round-trips.",
+                     "inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}]}}
+```
+
+`name`, `description`, `inputSchema` — **the schema you register on a Gateway target is literally what its `tools/list` hands back.** The schema file and the discovery response are the same contract seen from the two ends of the wire, and `list_tools_sync()` is this call with the result wrapped as `MCPAgentTool` objects.
+
+**In the SDK, the handshake is `with client:`.** `MCPClient.start()` opens the transport, sends `initialize`, and blocks until the result arrives. Run against both test servers:
+
+| Endpoint | Outcome |
+| --- | --- |
+| the MCP server | block entered in 0.1 s; `list_tools_sync()` returned `['ping']` |
+| the plain web server | `MCPClientInitializationError: the client initialization failed` in 0.1 s |
+
+Note that the non-MCP endpoint failed **fast**, not at the 30-second `startup_timeout`. A server that is reachable but answers wrongly fails as soon as the transport sees the bad response — here a `501` — and the real cause is in the logged traceback (`httpx.HTTPStatusError: ... 501 Unsupported method`) rather than in the one-line exception message. The timeout path is for an endpoint that accepts the connection and then never completes the handshake, or cannot be reached at all.
+
+> **Note:** two conventions make a URL _worth trying_, neither proves anything: streamable-HTTP MCP endpoints conventionally end in `/mcp` (the Gateway's does), and they accept `POST` of JSON with an `Accept` header listing both `application/json` and `text/event-stream`, since the server may stream a reply as SSE. The `curl` form above is worth running once against any new endpoint — it separates "not MCP" from "MCP, but my client is misconfigured", which the SDK's error alone does not.
+
+## No authentication, deliberately
+
+The Gateway is created with **No Authentication** for development, which is why the agent needs no auth headers. Treat the endpoint URL accordingly: an unauthenticated Gateway URL is a capability — anyone holding it can invoke every tool behind it — so it does not belong in source control or in saved notebook output. A later module adds AgentCore Identity for authenticated calls.
+
+## Key takeaways
+
+- Gateway is a managed MCP server fronting your services; the agent is an MCP client. Nothing behind the Gateway speaks MCP.
+- The schema is the contract: `name` / `description` / `inputSchema`, the same three parts `@tool` generates — authored by hand because the Gateway cannot introspect a remote function.
+- One Lambda serves several tools; the handler routes on `bedrockAgentCoreToolName`, stripping the `target___` prefix.
+- `MCPClient` is lazy until `with`; the block owns the session, so discover tools _and_ invoke the agent inside it.
+- The agent code barely changes: `@tool` functions out, `MCPClient` + `list_tools_sync()` in. The LLM sees identical schemas and cannot tell local from remote.
