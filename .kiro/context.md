@@ -190,6 +190,29 @@ Cost so far is about $0.003, at $0.25 per 1,000 short-term events, billed to Voc
 after 7 days but **the resource itself persists until deleted** — teardown is Step 10 of the notebook
 (`delete_memory_and_wait`, then verify with `list_memories`).
 
+**TORN DOWN 2026-10-02 (new lab account, ends `6465`).** CloudFormation stack `wanderbot-gateway-demo` from
+`lab_5/Demo/demo.ipynb` — two IAM roles, Lambda `wanderbot-booking-tools`, Gateway `wanderbot-gateway`
+(MCP, no auth), target `booking-target` — was deleted by Step 9 (`delete_stack` + waiter) and **verified gone
+from three independent angles**: `describe_stacks` → does not exist, `list_gateways` → no match,
+`get_function` → `ResourceNotFoundException`. Nothing from lab 5 is running in `6465`. The whole Part B ran end
+to end first: discovery returned `booking-target___get_booking` / `___list_bookings_by_email`, a direct
+`call_tool_sync` and three agent questions all reached the Lambda (six `Tool called` lines in CloudWatch), then
+teardown. Step 6 recreates the stack in ~1 min if needed. Only the `/aws/lambda/wanderbot-booking-tools` log
+group may remain (CloudFormation does not own Lambda log groups it did not declare) — 0 bytes of cost.
+
+**Orphaned in the OLD lab account (ends `6087`), created 2026-10-02 by `lab_5/Demo/demo.ipynb` Step 6
+and NOT torn down.** Five resources from the hand-built (non-CloudFormation) attempt: IAM roles
+`wanderbot-booking-lambda-role` and `wanderbot-gateway-role` (the latter with inline policy
+`InvokeBookingLambda`), Lambda `wanderbot-booking-tools`, Gateway `wanderbot-gateway` (`READY`, no
+auth), and target `booking-target`. They could not be deleted because Mark switched `[default]` to a
+different lab account (ends `6465`) the same day and the old account's profile
+`udacity-agentic-ai-profile` then returned `InvalidClientTokenId` — its STS token had expired. **Cost
+while idle: zero** (Gateway bills only per tool call; Lambda and IAM roles are free). **To clean up:**
+refresh credentials for `6087` from the classroom, then delete in reverse order — target, Gateway,
+Lambda, the two roles (detach `AWSLambdaBasicExecutionRole` and delete the inline policy first). Or
+simply let the lab account expire. The `6465` account started empty and gets the CloudFormation
+version instead; see Status.
+
 ## 6. Status
 
 | Item | State |
