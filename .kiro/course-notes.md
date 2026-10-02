@@ -1197,6 +1197,36 @@ The production shape is to run the tool as its own service and put something bet
 | **How the agent learns about it** | imported in code | discovered at runtime over MCP |
 | **Deployed with** | the agent | independently |
 
+## What is a Gateway target?
+
+**A Gateway holds no tools of its own.** It is the MCP front door; the tools live on **targets** attached to it. A target is one backend plus the description of what that backend offers — and the Gateway is the thing that turns "attached targets" into "a single list of tools" when the agent asks.
+
+```
+Gateway  wanderbot-gateway                     one MCP endpoint, one URL
+  |
+  +-- target  booking-target   -> Lambda      get_booking, list_bookings_by_email
+  +-- target  hotel-target     -> Lambda      search_hotels, ...          (not built here)
+  +-- target  ...              -> OpenAPI     every operation in the spec
+```
+
+A target is three things, fixed when you create it:
+
+| Part | What it is | In this lab |
+| --- | --- | --- |
+| **The backend** | what the Gateway invokes | one Lambda function, by ARNs |
+| **The tool schema** | what that backend offers, in MCP terms | `booking_lambda.json`, two tools |
+| **The credential provider** | how the Gateway authenticates _to_ the backend | the Gateway's own IAM role |
+
+**Targets are typed by backend.** Lambda is one of several. The control-plane API's `targetConfiguration` accepts `lambda`, `openApiSchema`, `smithyModel`, `mcpServer`, `apiGateway` and `connector` — so the same Gateway can front a Lambda, a REST API described by an OpenAPI document, and another MCP server, and the agent sees one flat tool list regardless. For an OpenAPI target the schema _is_ the spec, and each operation becomes a tool; for Lambda there is nothing to introspect, which is why you supply the tool schema by hand.
+
+**The credential provider is the half the console hides.** Every target needs one, and for a Lambda it is `GATEWAY_IAM_ROLE` — the role you gave the Gateway at creation, which must be allowed `lambda:InvokeFunction` on that ARN. The other options (`OAUTH`, `API_KEY`, `CALLER_IAM_CREDENTIALS`, `JWT_PASSTHROUGH`) are for backends that want their own authentication, and they are the mechanism by which a Gateway can hold a secret the agent never sees. The console sets `GATEWAY_IAM_ROLE` silently when you "create a new service role"; building the target with the API or CloudFormation, you must say it, and the service refuses a Lambda target without it.
+
+> **Note:** the role is _not_ checked when the Gateway is created — `create_gateway` accepts any ARN. It is checked when the **target** is attached, with "Gateway execution role lacks permission to invoke Lambda function". So a bad role surfaces at target creation, and IAM's eventual consistency means a _correct_ role attached seconds earlier can be refused once and succeed on retry.
+
+**The target name becomes part of every tool name.** The Gateway exposes each tool as `<target>___<tool>` — `booking-target___get_booking`. That prefix is what keeps two targets that each define a `search` tool from colliding, and it is the string the Lambda handler strips to recover the function name. The target name you choose is therefore not cosmetic: it is in the protocol.
+
+**Lifecycle, and why it matters for idempotency.** A target has its own status (`CREATING`, `READY`, `FAILED`, plus `SYNCHRONIZING` for backends the Gateway re-reads), and it can only be attached to a Gateway that is already `READY`. A target is a child of its Gateway — delete the Gateway and its targets go with it — but it is addressed by its own `targetId`, and `list_gateway_targets` has no filter-by-name, so finding "the target I already made" means scanning the list. One Gateway, many targets, each independently added, updated or removed without touching the others: that is the unit of change, and it is what lets a tool backend be swapped without the agent noticing.
+
 ## The flow, end to end
 
 ```
