@@ -1366,7 +1366,104 @@ The Gateway is created with **No Authentication** for development, which is why 
 ## Key takeaways
 
 - Gateway is a managed MCP server fronting your services; the agent is an MCP client. Nothing behind the Gateway speaks MCP.
+- Gateway decouples agent and backend. You can version, update, or replace a Lambda without redeploying the agent.
 - The schema is the contract: `name` / `description` / `inputSchema`, the same three parts `@tool` generates — authored by hand because the Gateway cannot introspect a remote function.
 - One Lambda serves several tools; the handler routes on `bedrockAgentCoreToolName`, stripping the `target___` prefix.
 - `MCPClient` is lazy until `with`; the block owns the session, so discover tools _and_ invoke the agent inside it.
 - The agent code barely changes: `@tool` functions out, `MCPClient` + `list_tools_sync()` in. The LLM sees identical schemas and cannot tell local from remote.
+
+# From Hardcoded Keys to Managed Credentials
+
+The previous lesson's Gateway targets were all open — no authentication anywhere. Real APIs are not. Horizon's Loyalty Points REST API sits behind API Gateway with **API key required**, so a call without an `x-api-key` header gets a `403` before the Lambda behind it ever runs.
+
+The reflex is to put the key in the agent. That is the thing the lesson exists to stop, and the reasons are mechanical rather than moral: a hardcoded key **breaks on rotation** (every agent carrying it must be redeployed), **leaks through logs** (it is a string in the process, so it ends up wherever strings end up), and **does not scale** (ten agents, ten copies, ten places to update). The fix is to make credentials an _infrastructure_ concern — stored once, injected at the boundary — so the agent never holds one at all.
+
+## What is AgentCore Identity?
+
+**AgentCore Identity** is the credential store for Gateway targets. You put a credential in once — an API key here; OAuth client credentials are the other common case — and the Gateway fetches it and attaches it to each outbound request. The agent never sees the key; it does not even know a key exists.
+
+Under the hood it is a thin, purpose-built front on **AWS Secrets Manager**: `CreateApiKeyCredentialProvider` returns an `apiKeySecretArn`, and that secret is where the value actually lives. What Identity adds over raw Secrets Manager is the _binding_ — a credential provider is an object a Gateway target can reference, with the injection rules attached to it.
+
+## Where the key gets attached — and where it does not
+
+The previous topic's target section said every target has a **credential provider**, and that for a Lambda target it is `GATEWAY_IAM_ROLE`. This lesson is that same slot with a different value. Nothing else about the architecture moves:
+
+```
+Agent  -- MCP -->  Gateway  -- adds x-api-key: <key> -->  API Gateway  -->  Lambda
+                     |
+                     +-- fetches the key from Identity on each call
+```
+
+The agent's side of that diagram is byte-for-byte the previous lesson's code: the same `MCPClient`, the same `list_tools_sync()`, the same `Agent(tools=tools)`. No `IdentityClient`, no `requests.get`, no `Authorization` header. One new tool simply appears in the discovery list, because one new target was attached to the Gateway.
+
+A target's API-key binding has four parts, and the demo's console form is asking for them:
+
+| Setting | Meaning | In this lesson |
+| --- | --- | --- |
+| **`providerArn`** | which Identity credential to use | the `WanderBot loyalty API key` provider |
+| **`credentialLocation`** | `HEADER` or `QUERY_PARAMETER` | `HEADER` |
+| **`credentialParameterName`** | the header or parameter name | `x-api-key` |
+| **`credentialPrefix`** | text prepended to the value | none — used for `Bearer ` with OAuth-style tokens |
+
+> **Note:** `credentialLocation` has exactly two values. An API that wants its key somewhere else — a cookie, a request body — cannot be fronted this way; it would need an OAuth provider or a Lambda in between.
+
+## The failure first, then the fix
+
+The demo is sequenced to make the injection visible by its absence:
+
+1. **API key required, confirmed with `curl`** — `403` without the header, `200` with it. The protection is real and it lives at API Gateway, not in the Lambda.
+2. **Target added with no credential.** The Gateway happily registers it; the tool shows up in `list_tools_sync()`. Discovery only reads the schema, so nothing here needs the key.
+3. **The agent calls the tool and gets a `403`** — relayed back as a failed tool call. The Gateway reached the API and the API refused it. This is the step the lesson wants you to see, because it separates "the tool exists" from "the tool works".
+4. **Credential created in Identity**, key value pasted in once.
+5. **Target edited** to reference that provider as a `HEADER` named `x-api-key`. The identical agent invocation now returns loyalty points.
+
+That gap between steps 2 and 3 is the same lesson the Lambda target taught from the other side: registration validates the _shape_ of a target, and only the first real invocation validates that it can reach what is behind it.
+
+## Why this is the part that actually matters: rotation
+
+Rotate the key at API Gateway, update the one value in Identity, and **the next tool call picks it up**. No agent redeploy, no configuration push, no restart — the Gateway fetches the current value per request. Compare the hardcoded version: a rotation means every agent carrying the old key is broken until each one is rebuilt and redeployed, and until then the old key must stay valid, which defeats the rotation.
+
+That single property is why credentials belong at the Gateway boundary rather than in the agent. The agent's job is to decide _which_ tool to call. Whether that tool needs a key, what the key is, and when it last changed are facts the agent has no business knowing — and once it does not know them, it cannot leak them.
+
+## One step further: a Gateway as the target of another Gateway
+
+The second half of the demo reuses every piece above for a different purpose. Instead of a credential that lets the Gateway reach an _API_, Identity holds a credential that lets one Gateway reach _another Gateway_ — and the two sides of the Gateway's security model meet for the first time.
+
+**A Gateway has two auth boundaries, and until now only one was in play.**
+
+| Boundary | Question it answers | Set by |
+| --- | --- | --- |
+| **Inbound** — who may call this Gateway? | `authorizerType` at creation: `NONE`, `AWS_IAM`, `CUSTOM_JWT`, `AUTHENTICATE_ONLY` | the Gateway owner |
+| **Outbound** — how does this Gateway reach each target? | the target's credential provider: IAM role, API key, OAuth | per target |
+
+Every Gateway so far was `NONE` inbound — anyone with the URL could call it — and the lesson's first half was entirely about the _outbound_ side. The new `wanderbot-hotel-gateway` is the first with inbound auth: **`CUSTOM_JWT`**, meaning a caller must present a JSON Web Token that validates against an OIDC `discoveryUrl`. The console offers to stand up a **Cognito** user pool and app client to issue those tokens, and that choice produces the thing the rest of the demo turns on: a **client id and secret**.
+
+**Then the chain.** Those Cognito credentials are stored in Identity as an **OAuth client** (vendor `CognitoOauth2`, one of some twenty-five named providers plus `CustomOauth2`). Back on the _first_ Gateway, a new target is added of type **`mcpServer`**, whose endpoint is the hotel Gateway's URL and whose credential provider is that OAuth client.
+
+```
+Agent  -- MCP, no auth -->  booking Gateway  (inbound NONE)
+                               |-- target: Lambda        via GATEWAY_IAM_ROLE
+                               |-- target: Loyalty API   via API key in Identity
+                               +-- target: mcpServer  -- MCP + JWT -->  hotel Gateway  (inbound CUSTOM_JWT)
+                                     ^                                     +-- target: Hotel API (open)
+                                     +-- Identity: OAuth client -> Cognito token, injected per call
+```
+
+On each call to a hotel tool, the booking Gateway asks Identity for the OAuth client, Identity obtains a token from Cognito using the **client-credentials grant** — the machine-to-machine flow, no user involved — and the booking Gateway presents that token to the hotel Gateway, which validates it as JWT. The agent, still pointed at the booking Gateway with no auth, never knows the second Gateway exists.
+
+**What makes the `mcpServer` target different from every other type.** A Lambda target needs a hand-written tool schema; an OpenAPI target needs the spec. An `mcpServer` target requires **only an endpoint** — because the thing on the other end speaks MCP, the outer Gateway can simply call its `tools/list`, exactly as the agent calls the outer Gateway's. Discovery recurses. This is also why an MCP target's status includes `SYNCHRONIZING`: the outer Gateway periodically re-reads the inner one's tool list, so a tool added to the hotel Gateway appears on the booking Gateway without anyone editing the booking Gateway.
+
+> **Note:** the OAuth binding on a target requires `providerArn` **and** `scopes` — unlike the API-key binding, where only the ARN is mandatory. `grantType` is one of `CLIENT_CREDENTIALS`, `AUTHORIZATION_CODE` or `TOKEN_EXCHANGE`; a Gateway-to-Gateway hop is always `CLIENT_CREDENTIALS`, since there is no user to redirect.
+
+**Why bother chaining instead of adding the hotel API straight to the first Gateway?** Because the two Gateways can be owned by different teams. The hotel team runs its own Gateway with its own inbound policy, decides which clients may call it, and never hands anyone a Lambda ARN or an API key. The booking team integrates by holding one OAuth client. That is the organisational shape the first half's "credentials are infrastructure" claim was pointing at: every boundary between teams becomes an inbound-auth decision on a Gateway, and Identity is where the resulting credentials live.
+
+## Key takeaways
+
+- **AgentCore Identity is the credential store for your agent.** API keys, OAuth clients and other secrets live there — never in source code or environment variables. The value sits in Secrets Manager; Identity adds the binding a Gateway target can reference.
+- **The Gateway injects the credential for you.** Binding a target to an Identity-backed credential means the header or token is attached per request, outside the agent process.
+- **Agent code stays unchanged.** Adding a secured tool is a configuration task: deploy the API, store the key in Identity, add a Gateway target. No edits to the agent entrypoint — the demo's agent is byte-for-byte the previous lesson's.
+- **Rotate in Identity, not in code.** Update the credential once and the next tool call picks up the new value, with no redeployment.
+- **Match the header name exactly.** API Gateway's usage plan expects `x-api-key`; a typo produces the same `403` as a missing key, even when the Identity binding is otherwise correct — and nothing on the Gateway side will tell you which it was.
+- **A Gateway has an inbound boundary and an outbound one.** `authorizerType` decides who may call it; each target's credential provider decides how it reaches what is behind it. Chaining Gateways is one Gateway's outbound credential satisfying another's inbound check.
+- **An `mcpServer` target needs only an endpoint.** The outer Gateway discovers the inner one's tools over MCP and keeps them synchronised — discovery recurses.
+- **Credential management is infra, not application logic.** The agent stays focused on the conversation; the Gateway and Identity handle authentication, and the team boundaries fall out of where the Gateways are.
