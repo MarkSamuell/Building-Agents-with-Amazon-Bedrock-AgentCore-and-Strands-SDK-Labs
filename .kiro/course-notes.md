@@ -1621,3 +1621,182 @@ Creating the resource in the console asks for:
 - **`session_timeout` bounds session lifetime**; default 3,600 s. Shorten it for lookups — it is also what ends a session so a recording can be written.
 - **The system prompt is your allowlist** — name the domain and the URL pattern. For a hard boundary, use the browser resource's VPC-only network setting.
 - **The default browser is `aws.browser.v1`**: no recording, no bot auth. A custom browser resource adds both, plus profiles for signed-in continuity, and swaps in via `identifier=`.
+
+# From Passive Lookup to Active Reasoning: Agentic RAG
+
+Every retrieval WanderBot has done so far was **one-shot**: the model picked a tool, called it once, and answered from whatever came back. That is fine when the first result is the right one — a booking by reference, a Wikivoyage page by name. It fails quietly when it is not: the agent answers confidently from a page that was about the wrong city, or from a document that never contained the fact at all. Nothing in the loop asked *"was that any good?"*
+
+## What basic RAG does, and where it stops
+
+**Retrieval-Augmented Generation** is the pattern of fetching relevant documents and putting them in the prompt so the model answers from them rather than from training data. The basic version is a straight line:
+
+```
+query  ->  retrieve once  ->  generate  ->  answer
+```
+
+Its weakness is that it **never evaluates what it retrieved**. The retrieval step has no opinion about relevance; it returns the nearest matches and the pipeline moves on. If the query was phrased badly, or the answer needs two documents stitched together, or the first hit was a near-miss, the model is handed poor context and does its best with it.
+
+## What "agentic" adds: a loop with judgement in it
+
+**Agentic RAG** puts retrieval inside the agent's reasoning loop instead of in front of it. The agent treats search results as something to *assess*, not something to *trust*:
+
+```
+query -> plan -> retrieve -> assess -> (good enough?) -> answer
+                    ^                       |
+                    +-- reformulate / pivot <+  not yet
+```
+
+Three capabilities make up the loop:
+
+| Capability | What the agent does | The question it is asking |
+| --- | --- | --- |
+| **Planning** | decides _whether_ to retrieve at all, _what_ to fetch first (a definition before evidence), and how to combine results across steps | "What do I need to know, and in what order?" |
+| **Reflection** | inspects results: do they match the query's terms, do they answer the actual *what* or *why*, can each claim be pinned to a source? | "Does this actually answer it?" |
+| **Retry** | reformulates the query, switches tools, or retrieves again before committing | "What would I search for instead?" |
+
+The shift is from retrieval as a **tool the agent calls** to retrieval as a **step the agent reasons about**. Same tools; different loop around them.
+
+## How reflection is actually done
+
+There is no magic component for "judgement". It is implemented with the two things an agent already has:
+
+- **Prompting.** Instructions to score each passage for relevance, to list what is known versus still unknown before answering, or to require a source for every claim. The model does the assessing; the prompt tells it to.
+- **Scoring.** Sometimes a second model call — or a dedicated evaluator — rates retrieved passages on metrics such as **faithfulness** (is the answer supported by the sources?) and **relevancy** (do the sources address the question?). Frameworks ship these; they are not required to get the behaviour.
+
+Even without formal metrics, an agent told to reflect on its retrieval before answering behaves categorically differently from a static pipeline — it can notice it has nothing, and go again.
+
+## Why this follows the browser lesson
+
+WanderBot now has three kinds of retrieval — Lambda tools, Gateway targets, a live browser — and every one of them is called one-shot. The browser is the sharpest case: a Wikivoyage lookup for an ambiguous city name, a page that redirected, a section the model skimmed past. Agentic RAG is not a new tool. It is the discipline of making the agent check its own retrieval before it speaks, and the tools it checks are the ones already wired in.
+
+## Key takeaways
+
+- **Basic RAG retrieves once and never evaluates the result.** It is a pipeline, not a loop.
+- **Agentic RAG puts retrieval inside the reasoning loop**: plan, retrieve, assess, and retry or pivot before answering.
+- **Three capabilities**: planning (whether and what to retrieve), reflection (is this relevant and sourced?), retry (reformulate or change tools).
+- **Reflection is built from prompting and scoring**, not a special component. Faithfulness and relevancy are the common metrics; the behaviour does not require them.
+- **Same tools, different loop.** The retrieval tools from earlier lessons do not change; what changes is that the agent judges their output instead of trusting it.
+
+# From Prompt-Stuffed Policies to Grounded Answers
+
+Ask WanderBot what refund an Economy Flex ticket gets when cancelled three days out, and if that number is not in front of it, the model will **make one up** — and sound certain doing it. That is hallucination, and it is not a bug in the model so much as the model doing its job on the wrong inputs: asked to continue plausibly, it continues plausibly.
+
+The obvious fix is to put the policies in the system prompt. It does not scale. Horizon's cancellation tables, baggage rules and eight destination guides run to many thousands of tokens, re-sent on every turn (lab 4's "being reminded has a bill"); they change independently of the agent; and a model summarising a long prompt will still paraphrase a figure it should quote. The policies are **too large to stuff and too important to paraphrase**.
+
+The fix that scales is **grounding**: fetch the exact relevant text from a trusted source at answer time, and have the model answer from that. That is Retrieval-Augmented Generation, and on AWS the managed way to do it is a **Bedrock Knowledge Base**.
+
+## What is a Bedrock Knowledge Base?
+
+A **Knowledge Base** is a managed RAG backend. You point it at documents, and it handles the entire ingestion pipeline — read, chunk, embed, index — and then answers one question: *given this query, which chunks are most similar?*
+
+```
+INGEST (once, on sync)                         QUERY (every tool call)
+S3 docs -> parse -> chunk -> embed -> store    query -> embed -> similarity search -> top-k chunks
+                              |                              |
+                        Titan Text Embeddings v2 ------------+   (the SAME model, both sides)
+                              |
+                        S3 Vectors (the vector store)
+```
+
+The pieces, and why each is there:
+
+| Piece | What it does | In this lesson |
+| --- | --- | --- |
+| **Data source** | where the documents live | an S3 prefix holding `travel_policies.txt` and `destination_guides.txt` |
+| **Parser** | turns a file into text | Bedrock's default — right for plain text |
+| **Chunking** | splits text into overlapping pieces sized for retrieval | the default strategy; overlap keeps a sentence from being cut off at a boundary |
+| **Embedding model** | maps each chunk to a vector so "similar meaning" becomes "nearby" | **Titan Text Embeddings v2** |
+| **Vector store** | holds the vectors and answers nearest-neighbour queries | **S3 Vectors** — native to S3, no OpenSearch or Aurora cluster to run |
+| **Sync** | runs the ingest pipeline over the data source | a minute or two; the KB is unusable until it reports Ready |
+
+**The embedding model is the hinge.** Documents are embedded at ingest; the query is embedded at retrieval; the search finds chunks whose vectors sit nearest the query's. That only means anything if **both sides use the same model** — a query embedded with a different model lands in a different space and matches nothing sensible. The KB remembers which model it was built with and uses it for queries automatically, which is why the tool never names the model.
+
+> **Note:** chunking is where RAG quality is actually decided, and the default hides it. A chunk that splits the cancellation table from its header loses the fare-class column names; a chunk too large dilutes the match. The default is a reasonable start for prose. When answers come back vague, the chunking strategy is the first thing to revisit, not the model.
+
+## The whole integration is one `@tool`
+
+``` Python
+# pip install strands-agents bedrock-agentcore boto3
+# =====================================================
+# RAG AS A TOOL - the complete integration
+# =====================================================
+import boto3
+from strands import tool
+
+KB_ID = "<your knowledge base id>"       # from the console, after the KB is Ready
+REGION = "us-east-1"
+
+# Note the client: bedrock-AGENT-runtime, not bedrock-runtime. Knowledge Bases
+# live behind the agent-runtime API; the plain runtime API is for model calls.
+_bedrock_runtime = boto3.client("bedrock-agent-runtime", region_name=REGION)
+
+
+@tool
+def search_knowledge_base(query: str) -> str:
+    """
+    Search Horizon Travel's knowledge base for travel policies,
+    destination guides, baggage rules, and loyalty programme details.
+    Use this when a customer asks about policies, destinations, or travel tips.
+
+    Args:
+        query: The question or topic to search for
+    Returns:
+        Relevant information retrieved from the knowledge base
+    """
+    # 1. Bedrock embeds `query` with the KB's own model, searches S3 Vectors,
+    #    and returns the top-k chunks. No model generates anything here.
+    resp = _bedrock_runtime.retrieve(
+        knowledgeBaseId=KB_ID,
+        retrievalQuery={"text": query},
+    )
+    results = resp.get("retrievalResults", [])
+    if not results:
+        return f"No information found for: {query}"
+
+    # 2. Keep only the chunk text and join the chunks. The model reads this
+    #    as the tool's result and answers from it.
+    chunks = [r["content"]["text"] for r in results]
+    return "\n---\n".join(chunks)
+```
+
+This is lab 2's `@tool` pattern with a network call inside it, and nothing else. No RAG framework, no new runtime, no vector-store client — `boto3` and one API. The docstring is doing real work, as always: it is the text the model reads to decide *when* to call this, so "use this when a customer asks about policies, destinations, or travel tips" is the routing rule.
+
+**`retrieve()` retrieves; it does not answer.** The API embeds the query, runs the similarity search, and returns chunks with a relevance **`score`** and a **`location`** each. There is a sibling, `retrieve_and_generate()`, that also has a model write the answer — the demo deliberately does not use it, because the *agent's* model is the one that should compose the reply, with the chunks as context alongside the conversation and the other tools. Retrieval is a tool; generation is the agent.
+
+## What the tool throws away, and why it matters for "cite the source"
+
+Each result from `retrieve()` carries more than text:
+
+| Field | What it is | What the demo tool does with it |
+| --- | --- | --- |
+| `content.text` | the chunk | **kept** — joined with `---` |
+| `score` | relevance of this chunk to the query | **dropped** |
+| `location.s3Location` | which document, and where | **dropped** |
+
+The system prompt then asks the model to *"quote exact figures and cite the source section"*. It can quote figures, because they are in the text. But the "source section" it cites is whatever heading happened to land inside the chunk — `### 2.1 Cancellation Timeframes and Fees` — not real provenance; the document name and location were discarded before the model saw anything. It works here because the policy file has good headings. A production version would keep `location` and `score`: the first for honest citations, the second so the tool can refuse low-confidence chunks instead of handing the model a near-miss to paraphrase — which is exactly the reflection step the agentic-RAG topic described.
+
+> **Note:** `retrieve()` accepts a `retrievalConfiguration` with `numberOfResults` and `overrideSearchType` (`SEMANTIC` or `HYBRID`, the latter adding keyword matching). The demo passes neither and takes the service defaults. For a policy document full of exact terms — fare class names, "48 hours" — hybrid search is often the better default, since pure semantic search can rank a paraphrase above the clause that literally contains the words.
+
+## The grounding instruction
+
+The tool makes retrieval *possible*; the prompt makes it *mandatory*:
+
+```
+ALWAYS use the search_knowledge_base tool before answering questions about:
+- Horizon Travel policies, rules, fees, or procedures
+- Destination information, attractions, or travel tips
+
+Base policy answers on retrieved content - quote exact figures and cite the source section.
+If the knowledge base doesn't cover the question, say so honestly.
+```
+
+Three instructions, each closing a different hole. **Always use the tool** stops the model answering a policy question from its own guess when it feels confident. **Quote exact figures** stops it rounding "70%" to "about two-thirds". **Say so honestly** gives it a sanctioned way to not answer — without that line, a model with no relevant chunk will fill the gap, which is the original hallucination wearing a RAG badge.
+
+## Key takeaways
+
+- **Hallucination is the model doing its job on the wrong inputs.** Grounding fixes the inputs: retrieve the exact text, then answer from it.
+- **A Knowledge Base is the managed pipeline** — S3 documents, default parser and chunking, Titan Text Embeddings v2, S3 Vectors — synced once and queried per call.
+- **Same embedding model on both sides** is what makes similarity search meaningful; the KB handles that for you.
+- **The whole integration is one `@tool` around `retrieve()`**, using `bedrock-agent-runtime` and plain boto3. Retrieval returns chunks; the agent's own model writes the answer.
+- **The demo tool keeps `content.text` and drops `score` and `location`.** Good enough for well-headed documents; keep both for real citations and for refusing weak matches.
+- **The prompt is the other half**: always retrieve, quote exactly, and say so when the KB has nothing.
