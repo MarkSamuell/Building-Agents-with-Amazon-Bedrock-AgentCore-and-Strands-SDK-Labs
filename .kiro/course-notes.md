@@ -1467,3 +1467,157 @@ On each call to a hotel tool, the booking Gateway asks Identity for the OAuth cl
 - **A Gateway has an inbound boundary and an outbound one.** `authorizerType` decides who may call it; each target's credential provider decides how it reaches what is behind it. Chaining Gateways is one Gateway's outbound credential satisfying another's inbound check.
 - **An `mcpServer` target needs only an endpoint.** The outer Gateway discovers the inner one's tools over MCP and keeps them synchronised — discovery recurses.
 - **Credential management is infra, not application logic.** The agent stays focused on the conversation; the Gateway and Identity handle authentication, and the team boundaries fall out of where the Gateways are.
+
+# From Static Knowledge to the Live Web
+
+Every answer WanderBot has given so far came from data someone fed it — hard-coded records, a Lambda, an API behind the Gateway. A lot of what travellers ask about lives on the web and changes constantly: which neighbourhood to stay in, what is on this month, whether the metro strike is over. No dataset keeps up with that, and the model's training data is a snapshot that is already stale. The agent needs to **go and look**.
+
+This lesson gives it a browser. Not a scraper, not an HTTP client — a real, managed, headless Chrome session running inside AWS, which the agent drives as a tool.
+
+## What is AgentCore Browser, and why a browser rather than `requests`?
+
+**AgentCore Browser** is a hosted headless Chrome that AgentCore starts on demand, isolated per session, and hands to the agent over the **Chrome DevTools Protocol** (CDP) — the same wire protocol a developer's DevTools panel uses. The Strands tool connects to it with Playwright (`chromium.connect_over_cdp`), so what the agent gets is a full browser: it navigates, waits for JavaScript to render, reads the resulting DOM, clicks, scrolls, fills forms.
+
+That is the answer to "why not just fetch the URL". An HTTP client gets the bytes a server sends, which for most modern sites is a shell that JavaScript fills in afterwards. A browser gets the page a human would see. The cost is weight — a Chrome process per session, started on demand — which is why sessions have a timeout and why the lesson spends a line on choosing it.
+
+| | `requests.get(url)` | AgentCore Browser |
+| --- | --- | --- |
+| **Gets** | the raw response body | the rendered page, after JavaScript |
+| **Can** | read | read, click, scroll, type, log in |
+| **Runs** | in the agent's process | in an isolated AWS-hosted Chrome |
+| **Costs** | nothing much | a session, billed while open |
+
+## The wiring: one import, one instance, one tool entry
+
+``` Python
+# pip install strands-agents strands-agents-tools playwright nest-asyncio
+# =====================================================
+# AGENT WITH A BROWSER - the whole change from the previous agent
+# =====================================================
+from strands import Agent
+from strands_tools.browser import AgentCoreBrowser
+
+
+@app.entrypoint
+async def invoke(payload: dict, context=None) -> dict:
+    user_message = payload.get("message", "Hello!")
+
+    # 1. Instantiate PER REQUEST, inside the entrypoint. Each invocation then
+    #    gets its own isolated session and a fresh timeout clock.
+    #    600s is plenty for a lookup; the default is 3600s.
+    browser = AgentCoreBrowser(session_timeout=600)
+
+    # 2. Pass browser.browser - the TOOL - not browser, the instance.
+    agent = Agent(
+        model=model,
+        system_prompt=SYSTEM_PROMPT,
+        tools=[browser.browser],
+    )
+    return agent(user_message)
+```
+
+**`browser.browser`, not `browser`.** This looks like a quirk and is in fact lab 2's `@tool` mechanism seen from a new angle. `AgentCoreBrowser` is an ordinary class; one of its _methods_ is decorated `@tool`, and that decorator is what turns the method into an `AgentTool` the agent can register. The instance owns the tool but is not one — pass the instance into `tools=[...]` and nothing is registered, silently. The same rule applied to `search_flights` in lab 2; it is just that there the function stood alone, and here it hangs off an object that also carries the session configuration.
+
+**The two extra packages are not optional — but they are _installed_, not _imported_.** The course is inconsistent here: the transcript says they "have to be imported", `demo.py` dutifully has `import nest_asyncio` and `import playwright` at the top, and the README says you need not import them at all. The README is right about the code. `strands_tools.browser` does `import nest_asyncio` and `from playwright.async_api import ...` itself, at module load — so the moment you import `AgentCoreBrowser`, both are already imported, and the two lines in `demo.py` are redundant. What is non-negotiable is `requirements.txt`: without the packages, the tool module's own imports fail before any tool runs — `ModuleNotFoundError: No module named 'nest_asyncio'` — and the agent container will not start. Neither installs a local Chromium; Chrome runs in AWS. They are the client half only. (`playwright` is imported for its `async_api`, which speaks CDP; `nest_asyncio` lets the tool run an event loop inside the one the agent is already running.)
+
+**Instantiate per request, not at module load.** A module-level `browser` would be shared across every invocation the container handles: one session, one timeout clock started at cold start, state leaking between unrelated travellers. Inside `invoke`, each request gets its own session and the timeout measures that request's work.
+
+## `session_timeout` — what it bounds and how to choose it
+
+The timeout is the **maximum lifetime of the hosted Chrome session**, in seconds. It is passed straight through to the service as `session_timeout_seconds` when the session starts. The default of 3,600 is an hour — sized for long agentic browsing, not for a lookup. Two things argue for shortening it: cost, since a session bills while it exists, and hygiene, since a session that outlives its request is a Chrome process holding whatever state it accumulated. Ten minutes covers any single Wikivoyage read with room to spare.
+
+> **Note:** the timeout is also what converts a live session into a **recording**, on a custom browser with recording enabled. The session must end — by timeout or completion — before the recording is finalised.
+
+## Can the agent come back to a session it opened?
+
+The natural question after a successful lookup: the agent searched, answered, and the timeout has not expired — is the browser still open, and can the next question reuse it? **For the demo as written, no.** The session may well still be alive on the AWS side, but the agent has lost its handle to it — and those are two different things. Separating them is the whole concept.
+
+**A "session" is three objects with three owners and three clocks:**
+
+| Object | Lives in | Ends when |
+| --- | --- | --- |
+| **The hosted Chrome session** | AWS, identified by a `sessionId` | `session_timeout` expires, or something calls `stop()` |
+| **The CDP connection and Playwright page** | the agent's process, inside the `AgentCoreBrowser` instance | the instance is destroyed, or the `close` action runs |
+| **The agent's knowledge that a session exists** | `agent.messages` — the model saw `init_session` return a session name | the `Agent` object is discarded |
+
+`session_timeout` governs only the first. The question is really about the other two.
+
+**The tool is one tool with many actions, and the model picks them.** `browser.browser` is a single `@tool`, but its input is an `action` — `init_session`, `navigate`, `get_text`, `click`, `new_tab`, `back`, `screenshot`, `close`, and a dozen more — dispatched inside the tool. So *within one invocation*, the model does what you would hope: it calls `init_session` once, then `navigate`, then `get_text`, reusing the same `session_name` across those calls. The session stays open between them and the agent genuinely returns to it, turn after turn. That is the multi-step browsing the tool exists for, and it works.
+
+**Across invocations, the demo throws it all away — on purpose.** `invoke` does this:
+
+``` Python
+browser = AgentCoreBrowser(session_timeout=600)     # a new instance every request
+agent = Agent(..., tools=[browser.browser])         # a new agent every request
+```
+
+When `invoke` returns, both go out of scope. `AgentCoreBrowser` has a `__del__` that runs `_cleanup()` → `close_platform()`, which calls `client.stop()` on every hosted session the instance started. So on the normal path the Chrome session is **actively closed at the end of the request**, long before the 600-second timeout. The timeout is the backstop for when that cleanup fails — the source says so in its own log line: *"failed to close session, relying on idle timeout to auto close"*.
+
+And even if a session did survive, the next request could not use it. Its `Agent` is new, with an empty message list (lab 4's whole lesson), so the model has never seen the session name. Its `AgentCoreBrowser` is new, with an empty client dictionary, so it holds no CDP connection. The session would be a Chrome process with no one holding its handle.
+
+**That is "instantiate per request", seen from the inside.** Each traveller gets an isolated session and a fresh timeout clock; nothing leaks between them. The price is exactly the thing the question noticed: no continuity between requests.
+
+**If you wanted continuity, the design changes, and each route has a cost:**
+
+- **Lift `browser` to module scope.** One `AgentCoreBrowser` across requests, so its sessions survive. But now every request shares them, the timeout clock starts at cold start, and cleanup is yours.
+- **Keep the agent's memory too** — `agent.messages`, or AgentCore Memory from lab 4 — so the model remembers the session name. A persistent session the model cannot name is useless to it.
+- **Browser Profiles** are the sanctioned answer to the question *behind* this one. Not "keep the session open" but "make the next session start from where this one left off" — cookies, logins, preferences. Sessions stay ephemeral; the **state** persists.
+
+The one-line version: **a session is reused freely within an invocation and deliberately destroyed between them; the timeout is a safety net, not the thing that normally ends it.**
+
+## The system prompt is the allowlist
+
+Nothing in the browser tool restricts where it may go. The _only_ thing steering it toward a trusted source is the prompt:
+
+```
+You have access to a live web browser. Use it to look up destination information
+on Wikivoyage (en.wikivoyage.org) - a free, open travel guide.
+
+When a customer asks about a destination:
+1. Navigate to en.wikivoyage.org/wiki/<DestinationName>
+2. Read the page - focus on highlights, neighbourhoods, and practical tips
+3. Summarise what you find clearly and concisely
+```
+
+Name the domain, and give the URL _pattern_ so the model does not have to search for the page. Leave the domain open and user input steers the browser anywhere — "look up X on this site I'll paste" becomes a navigation instruction. This is a prompt-level control, which means it is a steer and not a guarantee; a hard allowlist is a network-policy matter on the browser resource (below), not something the agent enforces.
+
+## What you see in the console: isolation and takeover
+
+Open the browser section of the AgentCore console during a request and the running session is listed, with a **View live session** that shows the actual Chrome rendering the page the agent is reading. Two properties are on display.
+
+**Isolation.** The session is not on your laptop and not on a shared box. Each one is a fresh, service-hosted Chrome with no state from your machine and no state from any other run. Two travellers' lookups cannot see each other's tabs.
+
+**Takeover.** From the live view a human can **take control** of the session — drive the browser by hand — and then **return control to the tool**. The agent is paused meanwhile and resumes with whatever state the human left. This is for the walls an agent cannot push through alone: a login page, a CAPTCHA, an unexpected consent dialog. It turns a fully autonomous browse into a semi-autonomous one with a human in reserve, without changing the agent.
+
+## The default browser, and when to make your own
+
+`AgentCoreBrowser()` with no `identifier` uses the browser AgentCore ships, whose id is literally `aws.browser.v1`. It works, and it has two gaps the lesson calls out: **it does not record sessions, and it has no web-bot authentication**. In production both tend to matter.
+
+A **custom browser resource** fixes them, and plugging it in is one argument:
+
+``` Python
+browser = AgentCoreBrowser(identifier="<your browser id>", session_timeout=600)
+```
+
+Creating the resource in the console asks for:
+
+| Option | What it does |
+| --- | --- |
+| **Recording** → S3 location | every session is captured and written to S3 once it ends — reviewable later, from the console or the bucket |
+| **Network: public or VPC-only** | whether Chrome may reach the internet or only resources inside a VPC — the hard version of the prompt's allowlist |
+| **Managed policies / root certificate** | for sites behind corporate proxies or private CAs |
+| **Web bot auth** | lets the browser handle CAPTCHA-style bot challenges itself, instead of stalling for a human |
+| **Execution role** | the role AgentCore uses to run the browser and write recordings — one-time setup, needs S3 write for the recordings bucket |
+
+**Profiles** are the last feature: a persistent store of cookies, saved preferences and signed-in state that a browser can be attached to, so every new session starts from it rather than from blank. Without one, each session is a brand-new visitor — correct for Wikivoyage, useless for anything behind a login. With one, the agent can be "already signed in" across runs.
+
+## Key takeaways
+
+- **AgentCore Browser is a real, hosted Chrome**, driven over CDP via Playwright — rendered pages and interaction, not raw HTTP. Nothing runs on your machine.
+- **One import, one instance, one tool entry.** `from strands_tools.browser import AgentCoreBrowser`, instantiate, pass `browser.browser` into `tools=[...]`.
+- **Pass the tool attribute, not the instance.** `browser.browser` is a `@tool`-decorated method; `browser` is an object that owns it. Passing the instance registers nothing.
+- **Instantiate per request**, inside the entrypoint — isolated session and fresh timeout per invocation.
+- **`playwright` and `nest-asyncio` go in `requirements.txt` — install, don't import.** The tool module imports both itself at load; the explicit `import` lines in `demo.py` are redundant. Without the packages installed, the container fails before any tool runs.
+- **`session_timeout` bounds session lifetime**; default 3,600 s. Shorten it for lookups — it is also what ends a session so a recording can be written.
+- **The system prompt is your allowlist** — name the domain and the URL pattern. For a hard boundary, use the browser resource's VPC-only network setting.
+- **The default browser is `aws.browser.v1`**: no recording, no bot auth. A custom browser resource adds both, plus profiles for signed-in continuity, and swaps in via `identifier=`.
