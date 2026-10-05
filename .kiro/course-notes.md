@@ -1792,6 +1792,67 @@ If the knowledge base doesn't cover the question, say so honestly.
 
 Three instructions, each closing a different hole. **Always use the tool** stops the model answering a policy question from its own guess when it feels confident. **Quote exact figures** stops it rounding "70%" to "about two-thirds". **Say so honestly** gives it a sanctioned way to not answer — without that line, a model with no relevant chunk will fill the gap, which is the original hallucination wearing a RAG badge.
 
+## The second approach: the community `retrieve` tool
+
+The custom tool above is the right way to *learn* what RAG does — every step is on the page. But if the default behaviour is all you want, the Strands tools package already ships it. `solution_bonus.py` is the whole agent with the RAG plumbing removed:
+
+``` Python
+from strands_tools import retrieve          # replaces: boto3 import, client, KB_ID, the @tool
+
+agent = Agent(
+    model=model,
+    system_prompt=SYSTEM_PROMPT,          # "ALWAYS use the retrieve tool ..." - the tool's name changed
+    tools=[retrieve],
+)
+```
+
+No `boto3` import, no client, no constant, no function. The knowledge base id is read from the **`KNOWLEDGE_BASE_ID`** environment variable at call time, so it is supplied at deployment rather than written into source:
+
+```bash
+agentcore deploy --env KNOWLEDGE_BASE_ID=<your kb id>
+```
+
+That is the production argument the demo makes: the same code deploys against a dev, staging and prod knowledge base by changing one variable, and nothing environment-specific lives in the repository.
+
+## Custom `@tool` versus `retrieve` — what actually differs
+
+"Less code" undersells the difference. Reading the community tool's source, it is doing **more** than the custom one, and some of it is exactly what the custom tool left out:
+
+| | Custom `search_knowledge_base` | Community `retrieve` |
+| --- | --- | --- |
+| **Code you own** | ~20 lines: client, constant, function | zero |
+| **KB id** | hard-coded `KB_ID` | `KNOWLEDGE_BASE_ID` env var, or a per-call argument |
+| **Region** | hard-coded `us-east-1` | `AWS_REGION` env var, **default `us-west-2`** |
+| **Result count** | service default | `numberOfResults`, default 5 |
+| **Relevance filtering** | none — every chunk returned goes to the model | **drops chunks below `score` 0.4** (`MIN_SCORE` env var) |
+| **Source metadata** | dropped | `enableMetadata` returns `location` and the source URI |
+| **Metadata filters** | none | `retrieveFilter` — `andAll` / `equals` / `greaterThan` on document metadata |
+| **Multiple KBs** | one, fixed | `knowledgeBaseId` per call, so one agent can search several |
+| **What the model sees** | chunk text joined by `---` | `Retrieved N results with score >= 0.4:` then chunks, each with its score |
+| **Tool name in the prompt** | `search_knowledge_base` | `retrieve` — the system prompt must change with it |
+
+Two rows deserve a second look. **The score floor is the reflection step** from the agentic-RAG topic, built in: a near-miss chunk is withheld rather than handed to the model to paraphrase, and the model is told how many results cleared the bar. And **the region default is `us-west-2`**. This lab's knowledge base is in `us-east-1`, so without `AWS_REGION` set (or a `region` argument) the tool looks in the wrong region and finds no knowledge base at all — a failure that reads like "KB has nothing," not like "wrong region." The custom tool cannot make that mistake because the region is in the file.
+
+> **Note:** in the installed `strands-agents-tools` (0.8.6), `retrieve` is marked **`@deprecated`**. Its own message: *"use `MemoryManager` with `BedrockKnowledgeBaseStore(writable=False)`. Note the store applies no relevance-score floor, so filter results yourself."* The warning becomes an error log in 0.9.0. So the "production pattern" the course recommends is one the SDK is already steering away from — toward a knowledge base treated as a read-only **memory store**, which folds this lesson back into lab 4's memory model. Worth knowing before building on it; the custom `@tool` has no such clock running.
+
+## When to use which
+
+**Reach for the custom `@tool` when:**
+
+- **You need to shape what the model sees.** Join chunks differently, prepend the document name, strip boilerplate, cap total length — anything between `retrieve()` returning and the model reading. The community tool's format is fixed.
+- **The retrieval call itself needs options the tool does not expose** — `overrideSearchType` for hybrid search, `rerankingConfiguration`, a guardrail — or a different API entirely (`retrieve_and_generate`, or a non-Bedrock store).
+- **You want the tool's name and description to carry domain routing.** `search_knowledge_base` with a docstring about "policies, destinations, baggage" tells the model when to call it better than a generic `retrieve` does; that docstring is the model's routing rule.
+- **You are learning, or reviewing.** Twenty lines on the page beats a dependency when the question is "what is this actually doing?"
+
+**Reach for the community `retrieve` when:**
+
+- **Default behaviour is the behaviour you want**: top-k chunks, a sensible relevance floor, optional sources.
+- **Configuration must vary by environment.** The env-var design is the point; a dev/staging/prod KB swap with no code change is what it is for.
+- **You want the score filter and metadata without writing them.** Those are the two things the custom tool skipped, and they are what "cite the source" and "refuse weak matches" actually require.
+- **One agent needs several knowledge bases** — `knowledgeBaseId` as a per-call argument makes that a prompt concern rather than a code one.
+
+And the honest tiebreaker: set `AWS_REGION` explicitly whichever you choose, and if you adopt `retrieve`, read its deprecation path before you depend on it. Same result either way — grounded answers, no hallucination; the difference is where the control sits, and which of the two keeps working as the SDK moves.
+
 ## Key takeaways
 
 - **Hallucination is the model doing its job on the wrong inputs.** Grounding fixes the inputs: retrieve the exact text, then answer from it.
@@ -1800,3 +1861,4 @@ Three instructions, each closing a different hole. **Always use the tool** stops
 - **The whole integration is one `@tool` around `retrieve()`**, using `bedrock-agent-runtime` and plain boto3. Retrieval returns chunks; the agent's own model writes the answer.
 - **The demo tool keeps `content.text` and drops `score` and `location`.** Good enough for well-headed documents; keep both for real citations and for refusing weak matches.
 - **The prompt is the other half**: always retrieve, quote exactly, and say so when the KB has nothing.
+- **Two ways to wire it.** A custom `@tool` around `retrieve()` when you need control over the call or what the model sees; the community `strands_tools.retrieve` when default behaviour plus env-var configuration is enough — it adds the score floor and source metadata the custom tool dropped, but defaults to `us-west-2` and is deprecated in favour of a knowledge-base memory store.
