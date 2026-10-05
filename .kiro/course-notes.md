@@ -1862,3 +1862,81 @@ And the honest tiebreaker: set `AWS_REGION` explicitly whichever you choose, and
 - **The demo tool keeps `content.text` and drops `score` and `location`.** Good enough for well-headed documents; keep both for real citations and for refusing weak matches.
 - **The prompt is the other half**: always retrieve, quote exactly, and say so when the KB has nothing.
 - **Two ways to wire it.** A custom `@tool` around `retrieve()` when you need control over the call or what the model sees; the community `strands_tools.retrieve` when default behaviour plus env-var configuration is enough — it adds the score floor and source metadata the custom tool dropped, but defaults to `us-west-2` and is deprecated in favour of a knowledge-base memory store.
+
+# Long-Term Memory: Building a Relationship Over Time
+
+Lab 4 gave WanderBot short-term memory and stopped there, with `strategies=[]` — raw events, one session, replayed into the prompt. That is the difference between a conversation and a stranger who forgets you the moment it ends. **Long-term memory** is what remains *across* sessions: your name, your preferences, the fact that the fix you tried last month worked. It turns a stateless tool into something that can personalise, stop asking the same questions, and get better with experience.
+
+For a one-off task, forgetting is fine. For a tutor, an assistant, a support bot, a character in a game — anything whose value is continuity — it is the whole product.
+
+## Three kinds of remembering
+
+Humans remember different kinds of things in different ways, and agent memory is grouped the same way. The three types differ in **what is stored** and **what it is for**:
+
+| Type | What it holds | Where it came from | How it is used | Example |
+| --- | --- | --- | --- | --- |
+| **Semantic** | facts learned through interaction | the user told you | retrieved by similarity or context and injected as knowledge | "your team uses Trello, not Jira" |
+| **Episodic** | past events and their outcomes | something happened | recalled as a precedent — _"I helped you with this before"_ — often as few-shot examples | "last time, the database steps I gave you worked" |
+| **Procedural** | how to behave | a pattern in how the user wants things done | changes the agent's prompt or rules, not its knowledge | "always formal tone in emails" |
+
+The distinction that matters most is the last row. Semantic and episodic memory change **what the agent knows**; procedural memory changes **how the agent acts**. A procedural memory does not get injected as a fact — it rewrites the instructions. That is what lets an agent evolve rather than merely accumulate.
+
+**How this maps onto AgentCore Memory.** The strategy families from the "What Is AgentCore Memory?" topic are these three types plus one:
+
+| Lesson's type | AgentCore strategy | Notes |
+| --- | --- | --- |
+| Semantic | `semanticMemoryStrategy` | extracted facts |
+| Episodic | `episodicMemoryStrategy` | has a separate `reflectionConfiguration` — the service reflects over episodes, not just stores them |
+| Procedural | `userPreferenceMemoryStrategy` | the closest fit: preferences that shape behaviour |
+| — | `summaryMemoryStrategy` | a condensed session record; sits between short- and long-term |
+
+So `strategies=[]` in lab 4 was the decision to have **none** of these. Adding one turns the same event stream into extracted, cross-session memory — asynchronously, minutes behind the conversation, as that topic noted.
+
+## Storing, scoping, retrieving
+
+**Capture.** When a user says something meaningful — a birthday, a team they manage, a preference — it is extracted and saved. Storage can be a vector database (Chroma, Pinecone), a relational store (PostgreSQL), or a document store (MongoDB); the choice follows how you intend to retrieve. AgentCore makes that choice for you.
+
+**Scope — who a memory belongs to.** This is the design decision with the sharpest consequences, because getting it wrong leaks one person's memories into another's conversation:
+
+| Scope | Belongs to | Example |
+| --- | --- | --- |
+| **User** | one identity | your favourite game |
+| **Team** | a workspace or group | "we use Trello" |
+| **Global** | everyone | patterns learned across all users |
+
+The agent identifies the current context — a user id, a team, an application route — and uses it to decide **which memory collections to query**. In AgentCore this is exactly what `actorId` and the strategy's **namespace template** do: `/strategy/{memoryStrategyId}/actor/{actorId}/` scopes to a user, dropping the actor segment scopes to everyone. Lab 4's `actor_id` isolation test was the user scope in action; the namespace path is how the other two are expressed.
+
+**Retrieval.** Triggered by semantic similarity, tags, time, or session context. The retrieved memories then reach the model one of three ways: injected into the **system prompt** (lab 4's read hook, now with facts rather than turns), supplied as **background context**, or passed as **tool parameters**. Same mechanism as short-term — the prompt gets longer — different source.
+
+## What to remember, and for how long
+
+The hard part of memory is not what you *can* store. It is what you *should*. Four practices, each closing a real failure:
+
+- **Selectivity.** Do not log every line. Store what is useful; the rest is noise that costs tokens on every retrieval and privacy on every breach.
+- **Expiry.** Set a **TTL** so memories that go stale retire themselves. A preference from two years ago may be wrong now, and a stale fact recalled confidently is a hallucination with a receipt.
+- **Separation.** Use **namespaces** so memories cannot collide or leak between users, teams or use cases. The AgentCore namespace template is this practice made structural.
+- **Balance.** Decide deliberately what is recalled globally versus what stays private, weighing personalisation against the risk of exposure.
+
+Three questions to ask of every memory design: *what should be remembered? how long should it persist? who can access it?* Long-term memory gives the agent continuity — but you decide when it evolves and when it forgets.
+
+## Is this just RAG?
+
+Reasonable question, since semantic memory and RAG both end in "retrieve relevant text and put it in the prompt." The difference is **where the information came from**:
+
+| | RAG | Long-term memory |
+| --- | --- | --- |
+| **Source** | static documents written by others | the interaction itself — facts, events, behaviours |
+| **Changes when** | someone edits and re-syncs the documents | every conversation |
+| **Belongs to** | the organisation | the user, the team, or everyone |
+| **Example** | the cancellation table in `travel_policies.txt` | "this customer always flies Economy Flex" |
+
+RAG tells the agent what Horizon's policy *is*. Memory tells it what *this traveller* said last time. Sometimes semantic memory looks like RAG from the outside; it is built differently and it evolves. And the closing line of the lesson is the one to keep: long-term memory is not about adding context — it is about **maintaining useful context**.
+
+## Key takeaways
+
+- **Short-term memory is within a session; long-term memory is across them.** The second is what makes personalisation, non-repetition and improvement possible.
+- **Three types**: semantic (facts), episodic (events and outcomes), procedural (behaviour). The first two change what the agent knows; the third changes how it acts.
+- **In AgentCore these are the strategy families** — semantic, episodic, user-preference, plus summary — and `strategies=[]` is the choice to have none.
+- **Scope is the critical design decision**: user, team or global, expressed in AgentCore through `actorId` and namespace templates. Wrong scope leaks memories between people.
+- **Store selectively, expire with TTLs, separate with namespaces, balance privacy against usefulness.**
+- **Memory is not RAG.** RAG retrieves from documents others wrote; memory is built from interaction and evolves with it.
