@@ -896,6 +896,24 @@ A language model has no memory. Every call is the first call. What looks like co
 
 This is easy to see rather than take on trust. An agent built fresh inside its request handler, with memory disabled, answers _"and what about 5 nights?"_ by asking which hotel you mean. Nothing carried over, because nothing was re-sent.
 
+## Why memory is not optional
+
+That one failure is the visible end of three, and each shows up in a two-turn conversation:
+
+| Failure | What it looks like | Why it happens |
+| --- | --- | --- |
+| **Lost context** | *"what about 5 nights?"* → *"5 nights where?"* | the earlier turn was never re-sent |
+| **Repetition** | asking for the destination again, mid-planning | nothing records that it was already given |
+| **Fragmentation** | each answer is locally sensible and globally incoherent | the agent reasons one message at a time |
+
+Memory is the mechanism that gives the agent **continuity** — the thing that makes a sequence of calls behave like one conversation. Short-term memory is the first and cheapest version of it: hold the recent turns and re-send them.
+
+## The constraint that shapes everything: the context window
+
+Why not just re-send *everything*, forever? Because the model has a **context window** — a hard ceiling on the tokens it can read in one call, model-specific, and spent on the prompt, the tool schemas, the history and the answer together. Every turn adds to the history; the window does not grow. So a conversation that re-sends everything *will* eventually overflow, and before it overflows it gets slower and more expensive per turn, since "being reminded has a bill" is paid on the whole history every time.
+
+That is the entire reason conversation management exists. Something has to decide which turns ride along and which are left behind, and the three strategies below are three answers to that question. Short-term memory, then, is not "remember the conversation" — it is "**fit a bounded, relevant slice of the conversation into a fixed window on every call.**"
+
 ## The three strategies, and what Strands calls them
 
 The trade is always the same: context fidelity against tokens. Strands ships a class for each option, and one of them is already switched on whether you asked for it or not.
@@ -936,6 +954,18 @@ The course splits this two ways — transient state versus session memory. Stran
 **The distinction that matters is not duration, it is whether the model sees it.** Conversation history is memory precisely because it is re-sent; agent state is deliberately *not* re-sent, which is what makes it the right place for a user id, a feature flag or a running counter — data your code needs and the model has no business reading, and which costs no tokens.
 
 `Agent(state=...)` takes an `AgentState` or any JSON-serialisable dict, and `agent_id` names the agent for session management.
+
+## What a session actually is
+
+The word is used loosely, so pin it down: a **session** is the boundary within which short-term memory applies. It groups a sequence of interactions as one conversation, and it is the unit the three strategies above operate on — the window slides over *this session's* messages, the summary condenses *this session's* history. Three things mark it:
+
+| Boundary | What defines it | In AgentCore |
+| --- | --- | --- |
+| **Start** | a new interaction with no prior context | a new `sessionId` is issued |
+| **Identity** | the id every turn in the conversation shares | `context.session_id`, supplied by Runtime on each invocation |
+| **End** | explicit close, timeout, or the user walking away | `agentcore stop-session`, or the Runtime session lifetime |
+
+Everything inside the boundary is one conversation; a new session starts from zero. That is the lab 4 failure stated as a definition — a fresh `Agent` per invocation *is* a new session unless something carries the history across. And it is why **actor ≠ session**: the same traveller (one `actorId`) returns across many sessions, which is precisely the gap long-term memory fills in the later topics.
 
 ## Is short-term memory ephemeral?
 
@@ -1940,3 +1970,154 @@ RAG tells the agent what Horizon's policy *is*. Memory tells it what *this trave
 - **Scope is the critical design decision**: user, team or global, expressed in AgentCore through `actorId` and namespace templates. Wrong scope leaks memories between people.
 - **Store selectively, expire with TTLs, separate with namespaces, balance privacy against usefulness.**
 - **Memory is not RAG.** RAG retrieves from documents others wrote; memory is built from interaction and evolves with it.
+
+# From Session Memory to a Lasting Relationship
+
+Lab 4's short-term memory had a hard edge: it replayed the turns of *one session*. A Gold-tier traveller coming back tomorrow — new `sessionId`, same person — starts from nothing and repeats their window-seat preference for the fifth time. This lesson gives WanderBot memory that is scoped to the **person, not the conversation**, by adding two long-term strategies to the memory resource from lab 4 and wiring a second `HookProvider` to read and write them.
+
+## The gap worth closing first: how can one resource hold two kinds of memory?
+
+Short-term and long-term memory live in the **same memory resource**, and both are "recovered from memory." So how are they different, and how does the agent know what to extract? The honest answer is that the course under-explains this. Here is what is actually going on, verified against the SDK.
+
+**One resource, one write, two stores, two reads.** Every interaction is written exactly once, with `create_event`. From there the paths split:
+
+```
+                         create_event(actor, session, [(text, USER), (text, ASSISTANT)])
+                                            |
+                                            v
+                              +---------------------------+
+                              |   raw EVENTS, immutable   |   <-- short-term memory IS this
+                              |  keyed actor + session    |
+                              +---------------------------+
+                                  |                 |
+              list_events / get_last_k_turns        |   extraction JOB (async, service-side, minutes)
+              exact replay of one session           |   runs each strategy's extractor over the events
+                                                    v
+                              +---------------------------+
+                              |     MEMORY RECORDS        |   <-- long-term memory IS this
+                              |  per strategy, in a       |
+                              |  NAMESPACE, with a score  |
+                              +---------------------------+
+                                            |
+                              retrieve_memory_records(namespace, searchQuery, topK)
+                              semantic search across every session the actor ever had
+```
+
+| | Short-term | Long-term |
+| --- | --- | --- |
+| **What is stored** | the events themselves — raw text, verbatim | **records extracted from** events — facts and preferences, rewritten by a model |
+| **Who writes it** | you, with `create_event` | the service, by running a strategy's extractor over your events |
+| **When** | synchronously, on the call | an **extraction job**, asynchronously, minutes behind |
+| **Keyed by** | `actorId` + `sessionId` — required on `ListEvents` | a **namespace** such as `wanderbot/{actorId}/facts` — no session in it |
+| **Read API** | `ListEvents` → `get_last_k_turns` | `RetrieveMemoryRecords` → `retrieve_memories` |
+| **How it is read** | exact replay, newest-first | **semantic search**: a query, `topK`, each record with a relevance `score` |
+| **Across sessions?** | no — the key has the session in it | yes — the namespace does not |
+
+So "both can be recovered from memory" is true and misleading at once. `list_events` recovers *what was said in this session*. `retrieve_memory_records` recovers *what the service concluded about this person from every session* — different objects, different API, different shape. A short-term read returns `{"role": "USER", "content": {"text": ...}}`; a long-term read returns a `MemoryRecordSummary` with `content.text`, a `memoryStrategyId`, `namespaces` and a `score`. They do not even look alike.
+
+**"How does the agent know what to extract?" — it does not.** The agent never extracts anything. Lab 4's hook wrote every message; this lesson's hook writes the final `(USER, ASSISTANT)` pair. Either way the agent's only job is to **get the raw exchange into the event store**. Extraction is the *strategy's* job: `semanticMemoryStrategy` runs an extractor that pulls facts ("lives in London", "partner has a nut allergy"); `userPreferenceMemoryStrategy` pulls preferences ("window seat", "luxury travel"). Each writes what it finds into its own namespace. The service even exposes this as a first-class operation — `StartMemoryExtractionJob` and `ListMemoryExtractionJobs` exist on the data-plane API — which is why there is an "extraction delay" in the demo and why the `WanderBotNotebook` memory from lab 4, created with `strategies=[]`, accumulated events for days and never produced a single memory record. No strategy, no extractor, no long-term memory. The events were there the whole time.
+
+> **Note:** this is the same shape as RAG's ingest pipeline from lab 7, pointed at conversations instead of documents: a source stream, an extraction step the service runs, a vector-searchable store, a `topK` query with scores. The difference from the RAG topic's framing is the *source* — what this person said, not what the organisation wrote.
+
+## What an extractor actually is
+
+The natural next question: are the strategies' extractors AI agents, trained or prompted to pull certain things out of an event? **Prompted, yes — and the SDK proves it. Agents, no. Trained, unknown.**
+
+The built-in `SEMANTIC` and `USER_PREFERENCE` strategies hide their internals, but the **custom** variants expose the knobs, and the knobs give the mechanism away. `add_custom_semantic_strategy` takes:
+
+```
+extraction_config:    {"prompt": "...", "modelId": "..."}
+consolidation_config: {"prompt": "...", "modelId": "..."}
+```
+
+An extractor is **a prompt plus a model id**. The built-ins are the same machinery with AWS's prompts and model choice baked in; a custom strategy is where you supply your own. Everything observed in the notebook follows from a model reading a prompt: the first-person-to-third-person rewrite (*"my partner has a nut allergy"* → *"Alice's partner has a nut allergy"*), the preference extractor inventing a `context` and `categories` structure it was never shown, and the run-to-run variation — one pass keeping three preferences from a sentence, the next keeping one. Those are judgement calls, which is what a prompted model makes.
+
+**Two stages, not one.** The config names two prompts because there are two jobs:
+
+| Stage | Input | Output | Why it exists |
+| --- | --- | --- | --- |
+| **Extraction** | one event | candidate facts or preferences | pull what matters out of the exchange |
+| **Consolidation** | the candidates, plus what the namespace already holds | the maintained set of records | merge *"prefers luxury hotels"* from today with the same fact from last month instead of storing it twice; resolve contradictions |
+
+Consolidation is why a memory record is a **maintained fact** rather than a log line — the mechanism behind the long-term memory topic's closing line, *"maintaining useful context."* It is also another reason the final record set varies: two model passes, each making choices.
+
+**Why "agent" is the wrong word, and why it matters in this course.** Every lab has built agents in a specific sense: a model in a **loop** with tools — decide, act, observe, decide again. An extractor is a **single model call**: event in, records out, no tools, no iteration, no choice of what to do next. It is closer to lab 3's structured-output tool than to WanderBot. The agent-shaped thing is the service orchestration around it — the asynchronous job that notices new events and dispatches each strategy — but that is a pipeline, not a reasoning loop. Keeping the word precise keeps the course's central idea precise.
+
+**"Trained" cannot be settled from here.** A custom strategy takes a `modelId`, which points to ordinary foundation models with a prompt rather than models fine-tuned for extraction — but AWS's built-in prompts and model ids are not visible, so *prompted, probably not specially trained* is as far as the evidence reaches.
+
+> **Note:** two things the notebook observed and the course does not mention. **Extraction is non-deterministic**: the two strategies' jobs finish at different times and in no fixed order (~86 s / ~107 s one run, reversed the next), and the *set* of records differs between runs on near-identical input. And **the record shapes differ by strategy**: `SEMANTIC` returns plain third-person sentences; `USER_PREFERENCE` returns JSON with `context`, `preference` and `categories`. Any design that assumes a specific memory *will* exist, or that records share a shape, is building on sand — the hook's search-and-prepend-whatever-matched posture is the right one.
+
+## Adding the strategies to lab 4's resource
+
+Nothing is recreated. The existing memory resource is **edited** to add two strategies, each with a name and a **namespace template**:
+
+| Strategy | Name | Namespace template | Extracts |
+| --- | --- | --- | --- |
+| `SEMANTIC` | `user facts` | `wanderbot/{actorId}/facts` | factual statements about the traveller |
+| `USER_PREFERENCE` | `user preferences` | `wanderbot/{actorId}/preferences` | how they like things done |
+
+**`{actorId}` is a placeholder the service fills in per event.** When Alice's `create_event` arrives with `actor_id="alice-001"`, the facts the extractor finds are filed under `wanderbot/alice-001/facts`. Bob's go under `wanderbot/bob-002/facts`. That is the entire per-user scoping — the namespace *is* the scope — and it is the user-scope row from the long-term memory topic made concrete. Drop the `{actorId}` segment and the strategy would pool everyone's facts into one namespace, which is the team or global scope, and also the leak the lab 4 isolation test was guarding against.
+
+The hook resolves these at startup rather than hard-coding them:
+
+``` Python
+def get_namespaces(mem_client, memory_id):
+    """{"SEMANTIC": "wanderbot/{actorId}/facts", "USER_PREFERENCE": "wanderbot/{actorId}/preferences"}"""
+    strategies = mem_client.get_memory_strategies(memory_id)
+    return {s["type"]: s["namespaces"][0] for s in strategies}
+```
+
+One call to `get_memory_strategies` and the code knows what the console was configured with. Rename a namespace in the console and the agent follows without redeploying.
+
+## The hook: read before the model sees the turn, write after it answers
+
+Same `HookProvider` machinery as lab 4, two **different events**, and one deliberately different place to inject:
+
+``` Python
+class WanderBotMemoryHook(HookProvider):
+    def register_hooks(self, registry):
+        registry.add_callback(MessageAddedEvent, self._retrieve_travel_context)   # READ
+        registry.add_callback(AfterInvocationEvent, self._save_interaction)       # WRITE
+```
+
+**The read path — `MessageAddedEvent`, guarded.** Lab 4 read once, at `AgentInitializedEvent`, and appended turns to the *system prompt*. This hook reads on **every user message**, and for good reason: the query it searches with is the message itself. `retrieve_memories(namespace=..., query=user_query, top_k=5)` runs once per namespace — so two strategies, two searches per turn — and the hits are **prepended to the user's message** as a `Traveller Context:` block:
+
+```
+Traveller Context:
+[SEMANTIC] Alice lives in London and travels with her partner.
+[USER_PREFERENCE] Prefers luxury travel; budget around $5,000; interested in Asia.
+
+What do you recommend for a trip next spring?
+```
+
+Why the user message and not the system prompt? Because the context is **query-specific**. A system-prompt injection happens once and must carry everything that might be relevant; a per-message injection carries only what matched *this* question, ranked by score. It costs a search per turn and buys relevance.
+
+Two guards make this safe, and lab 4's Step 5 trace shows why they are needed. `MessageAddedEvent` fires for **every** appended message — user text, assistant tool-use, and the `toolResult` the framework appends with `role: user`. The hook checks `messages[-1]["role"] == "user"` and that the first block is not a `toolResult`, so it only searches and injects on a genuine human turn. Without that check, a tool's output would get a Traveller Context prepended to it.
+
+**The write path — `AfterInvocationEvent`, once.** Lab 4 wrote on every `MessageAddedEvent`. This hook waits until the whole turn is finished, walks `agent.messages` backwards to find the last assistant text and the last real user text (skipping tool results again), and writes **one event holding the pair**:
+
+``` Python
+self.memory_client.create_event(
+    memory_id=self.memory_id, actor_id=actor_id, session_id=session_id,
+    messages=[(user_text, "USER"), (agent_text, "ASSISTANT")],
+)
+```
+
+One event, two messages — the shape lab 4's Step 8 probe wrote by hand. The extractor gets the exchange as a unit, which is better material for "what did we learn about this person" than a stream of fragments. It also means the write is one network call per turn instead of lab 4's four, and tool activity never reaches the event store — deliberately this time, rather than as a side-effect of a missing `text` key.
+
+**`agent.state` carries the ids, as before.** The entrypoint takes `session_id` from `context` and `actor_id` from the payload, puts both in `state`, and the hook reads them back. The agent code itself still never touches memory. Note `tools=[]`: this agent has no tools at all, so the whole demonstration is the memory.
+
+## What the demo proves, and the delay in the middle
+
+Session 1: Alice introduces herself — luxury travel, Asia, a $5,000 budget — across two invocations. Each turn's `(USER, ASSISTANT)` pair becomes an event; the extraction job turns them into records in `wanderbot/alice-001/facts` and `.../preferences`. Then `agentcore stop-session`, so the next call gets a **new `sessionId`**. Session 2: a recommendation request from the same `actor_id`, and the answer already knows the budget and the region. *"What do you remember about me?"* is the closing proof — nothing in session 2's events could have answered it.
+
+The thing to notice is the pause between the sessions. Extraction is asynchronous, and the records do not exist until the job has run. Ask too soon and session 2 is a stranger — not because memory failed, but because it has not been *written yet*. The lab 4 topic quoted the SDK's own advice on this: `wait_for_memories` to poll an empty namespace, or a fixed `time.sleep(150)` when it is not empty. Long-term memory is **eventually consistent**, and a design that needs a fact from the current turn to be recalled in the next one cannot rely on it.
+
+## Key takeaways
+
+- **Short-term and long-term memory share one resource and one write (`create_event`) and nothing else.** Short-term is the raw events, keyed by actor + session, read back verbatim with `list_events`. Long-term is records the service **extracts** from those events, filed by namespace, found by semantic search with `retrieve_memory_records`.
+- **The agent never extracts.** It writes the exchange; the strategy's extractor decides what is a fact or a preference. No strategy means no extraction — lab 4's resource stored events for days and held zero memories.
+- **Extraction is an asynchronous job**, minutes behind the conversation. Session 2 remembers only once the job has run.
+- **The namespace template is the scope.** `wanderbot/{actorId}/facts` is per-user because `{actorId}` is in it; `get_memory_strategies` lets code read the templates instead of hard-coding them.
+- **Read per message, into the user message; write once, after the turn.** `MessageAddedEvent` with a role-and-toolResult guard for retrieval; `AfterInvocationEvent` for one `(USER, ASSISTANT)` event.
+- **Same hook pattern as lab 4, same `agent.state` plumbing**, two different events and a different injection point — chosen because the retrieved context is specific to the question being asked.

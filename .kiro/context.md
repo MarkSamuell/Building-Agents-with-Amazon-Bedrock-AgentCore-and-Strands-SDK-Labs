@@ -190,6 +190,19 @@ Cost so far is about $0.003, at $0.25 per 1,000 short-term events, billed to Voc
 after 7 days but **the resource itself persists until deleted** — teardown is Step 10 of the notebook
 (`delete_memory_and_wait`, then verify with `list_memories`).
 
+**LIVE in the NEW lab account (ends `6465`), created 2026-10-10 by `lab_8/Demo/demo.ipynb` Step 2 and
+deliberately left running.** AgentCore Memory resource named **`WanderBotLongTerm`**, us-east-1, with two
+long-term strategies: `semanticMemoryStrategy` "user_facts" → `wanderbot/{actorId}/facts`, and
+`userPreferenceMemoryStrategy` "user_preferences" → `wanderbot/{actorId}/preferences`; `event_expiry_days=7`.
+Holds events and extracted records across several actors (`alice-001`, `alice-live`, `probe-alice`, several
+`probe-*`/`alice-verify-*` throwaways, `cold-start-probe`). **Cost while idle: zero beyond stored records** —
+short-term $0.25/1k events, long-term $0.75/1k records stored, $0.50/1k retrieved; well under a cent so far.
+Id suffix not recorded (public repo); recover with `MemoryClient.list_memories()` or
+`create_or_get_memory(name="WanderBotLongTerm", ...)`, which reuses it. **Teardown:**
+`delete_memory_and_wait(MEMORY_ID)` then verify with `list_memories()`. Observed in this notebook: extraction is
+asynchronous (~85–140 s), per-strategy jobs finish in no fixed order, and the set of extracted records varies
+run to run.
+
 **TORN DOWN 2026-10-02 (new lab account, ends `6465`).** CloudFormation stack `wanderbot-gateway-demo` from
 `lab_5/Demo/demo.ipynb` — two IAM roles, Lambda `wanderbot-booking-tools`, Gateway `wanderbot-gateway`
 (MCP, no auth), target `booking-target` — was deleted by Step 9 (`delete_stack` + waiter) and **verified gone
