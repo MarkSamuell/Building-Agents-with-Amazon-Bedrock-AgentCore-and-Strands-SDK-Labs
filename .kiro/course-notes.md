@@ -2168,3 +2168,68 @@ The thing to notice is the pause between the sessions. Extraction is asynchronou
 - **The namespace template is the scope.** `wanderbot/{actorId}/facts` is per-user because `{actorId}` is in it; `get_memory_strategies` lets code read the templates instead of hard-coding them.
 - **Read per message, into the user message; write once, after the turn.** `MessageAddedEvent` with a role-and-toolResult guard for retrieval; `AfterInvocationEvent` for one `(USER, ASSISTANT)` event.
 - **Same hook pattern as lab 4, same `agent.state` plumbing**, two different events and a different injection point — chosen because the retrieved context is specific to the question being asked.
+
+## Debugging memory from the terminal: `agentcore memory browse`
+
+Everything the notebook proved with Python can be checked, and debugged, without writing any — the Starter
+Toolkit ships a terminal browser for memory resources:
+
+```bash
+agentcore memory browse --memory-id <memory id> --region us-east-1
+```
+
+It uses the same boto3 credential chain as everything else — there is no `--profile` flag — and opens an
+interactive view of the resource.
+
+**The first screen is the whole two-store argument, drawn by AWS.** After the resource summary — status, expiry,
+and each strategy with its id and namespace template — the browse menu offers exactly two branches:
+
+```
+📋 Browse
+│  1 │ 👤 Actors (STM)     │     <- raw events, by actor then session
+│  2 │ 📊 Namespaces (LTM) │     <- extracted records, by strategy then actor
+```
+
+Short-term memory is navigated **actor → session → events**: what was said, verbatim. Long-term is navigated
+**strategy → actor → records**: what was extracted. Same resource, two trees, two different leaves — the thing
+this topic's first section argued, as a menu.
+
+**What a debugging session looks like.** Pick *Namespaces*, pick `user_facts`, and the browser lists **every
+actor that has records under that strategy**. In the real resource behind these notes that list was 22 entries
+long — `alice-001`, `alice-live`, a dozen `probe-*` and `cold-start-probe*` throwaways from the probe runs —
+which is itself a finding: every experiment left records behind, and nothing cleaned them up. Pick an actor and
+the records appear with their creation time:
+
+```
+WanderBotLongTerm-... > Namespaces > cold-start-probe3 > wanderbot/cold-start-probe3/facts
+│ 1 │ 2026-10-10 20:28:10 │ Mark's travel budget is approximately $5,000. │
+│ 2 │ 2026-10-10 20:28:10 │ Mark loves Asia as a travel destination.      │
+│ 3 │ 2026-10-10 20:28:10 │ The user's name is Mark.                      │
+│ 4 │ 2026-10-10 20:28:10 │ Mark prefers to travel in luxury style.       │
+```
+
+Four records, one timestamp — one extraction job wrote them together. Third-person sentences — the semantic
+extractor's shape. And the name is the one the user actually typed, which is exactly the check to make when an
+agent starts calling someone "Alex Chen": open the actor's namespace and see whether the name is *in the store*
+or *invented by the model*. Here it is in the store because the user said it; in the 7b case it was in no store
+at all.
+
+**The questions it answers in seconds**, each a problem the notebook hit the slow way:
+
+| Symptom | Where to look | What you learn |
+| --- | --- | --- |
+| "the agent doesn't remember me" | *Namespaces* → strategy → your actor | records exist (prompt or retrieval problem) or do not (extraction has not run, or wrong `actor_id`) |
+| "Step 4 wasn't empty" | *Namespaces* → your actor | leftover records from an earlier run; use a fresh actor |
+| "did extraction run yet?" | *Namespaces* → actor → record timestamps | the `Created` column is the extraction time, not the event time |
+| "which actor did the hook write under?" | *Actors (STM)* | the raw events, keyed exactly as `create_event` was called |
+| "what did the model actually see?" | *Namespaces* → actor | the record text is what `retrieve_memories` returns and the hook prepends |
+
+The non-interactive siblings cover the scripted cases: `agentcore memory list` (every resource in the region),
+`agentcore memory get <id>` / `status <id>` (one resource, its strategies, its provisioning state), and
+`agentcore memory show -m <id> -v -o dump.json` (actors, sessions, events and records exported as JSON — the
+thing to attach to a bug report).
+
+> **Note:** the toolkit prints a deprecation banner on every run — *"The Starter Toolkit CLI is no longer
+> supported... use the AgentCore CLI (@aws/agentcore)."* Set `AGENTCORE_SUPPRESS_RECOMMENDATION=1` to silence
+> it. The Node CLI needs Node 20+, which this machine does not have, so the Python toolkit remains the working
+> route here; the `browse` TUI is one of the things that may not survive the migration.
