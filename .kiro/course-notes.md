@@ -2154,30 +2154,17 @@ The thing to notice is the pause between the sessions. Extraction is asynchronou
 
 ## Key takeaways
 
+
+- Short-term memory lives in the session; long-term memory lives in strategy namespaces. Same memory resource — you just layer SEMANTIC and USER_PREFERENCE strategies on top.
+- Namespaces are scoped by actor_id, not session_id. A stable traveller ID (loyalty number, user id) is what makes memory last across sessions.
+- One hook, two events. MessageAddedEvent retrieves context before the LLM sees the turn; AfterInvocationEvent persists the final exchange once the response is complete.
+- Retrieval is semantic search per namespace. retrieve_memories(top_k=5) returns the most relevant facts and preferences for the current user query — not the raw transcript.
+- Extraction is asynchronous. create_event() stores the exchange; the memory service takes ~30 seconds to derive facts and preferences from it.
+- The agent code stays memory-unaware. It only sees a Traveller Context: block prepended to the user message — the hook does all the work.
+
 - **Short-term and long-term memory share one resource and one write (`create_event`) and nothing else.** Short-term is the raw events, keyed by actor + session, read back verbatim with `list_events`. Long-term is records the service **extracts** from those events, filed by namespace, found by semantic search with `retrieve_memory_records`.
 - **The agent never extracts.** It writes the exchange; the strategy's extractor decides what is a fact or a preference. No strategy means no extraction — lab 4's resource stored events for days and held zero memories.
 - **Extraction is an asynchronous job**, minutes behind the conversation. Session 2 remembers only once the job has run.
 - **The namespace template is the scope.** `wanderbot/{actorId}/facts` is per-user because `{actorId}` is in it; `get_memory_strategies` lets code read the templates instead of hard-coding them.
 - **Read per message, into the user message; write once, after the turn.** `MessageAddedEvent` with a role-and-toolResult guard for retrieval; `AfterInvocationEvent` for one `(USER, ASSISTANT)` event.
 - **Same hook pattern as lab 4, same `agent.state` plumbing**, two different events and a different injection point — chosen because the retrieved context is specific to the question being asked.
-- **A prompt that names an output block will get that block back, filled from whatever is to hand.** `demo.py`'s prompt names "Traveller Context" and the model echoes it on every cold turn, inventing a name when the message has none. Stating the empty case does not fix it; describing the behaviour without naming the block does. Set `max_tokens` so a runaway reply fails fast.
-
-## A trap that belongs to every notebook: boto3 caches credentials per session
-
-Refresh the lab's temporary credentials in `~/.aws-personal/credentials` while a kernel is running, re-run a cell,
-and it still fails with `ExpiredToken`. The file is correct — a fresh process authenticates immediately. The kernel
-is what is stale.
-
-**boto3 resolves credentials once per `Session` and holds them for that session's lifetime.** Every client built
-so far — Step 1's STS client, `MemoryClient`, `BedrockModel` — resolved from the file when it was first
-constructed and is still presenting that token. Editing the file changes the disk; nothing re-reads it. This is the
-same caching behaviour that made the credential *path* an environment-level decision in the lab 5 notes, now
-biting on the credential *value*.
-
-**Restart the kernel, then run from the top.** Re-running only the setup cell is not enough: it rebuilds one
-client, and the others keep the dead token until they too are rebuilt — so a later cell fails with the same error
-and looks like a different problem. Only a restart clears every session at once.
-
-The diagnostic that separates the two cases: `NoCredentialsError` means nothing was found (the environment);
-`ExpiredToken` or `InvalidClientTokenId` means something was found and rejected (the value, or a cached copy
-of it). Both appear at the first AWS call, and both have a one-step fix once you know which you are looking at.
