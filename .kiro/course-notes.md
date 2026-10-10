@@ -2107,6 +2107,45 @@ One event, two messages — the shape lab 4's Step 8 probe wrote by hand. The ex
 
 **`agent.state` carries the ids, as before.** The entrypoint takes `session_id` from `context` and `actor_id` from the payload, puts both in `state`, and the hook reads them back. The agent code itself still never touches memory. Note `tools=[]`: this agent has no tools at all, so the whole demonstration is the memory.
 
+## The prompt defect the demo hides, and the fix that did not work
+
+Run `demo.py`'s agent on a traveller with **no** memories yet — the first turn of any new user — and watch the
+answer, not the memory. The hook correctly finds nothing and leaves the message alone. The model then opens its
+reply with a bold **`Traveller Context:`** heading of its own, restates the user's details under it as if they
+had been retrieved, and keeps elaborating. In six cold-turn probes, all six did this, and three ran into the
+output-token limit — a `MaxTokensReachedException` that ends the invocation on a partial message. On a second
+turn whose message contained no name, the model addressed the traveller as **"Alex Chen"** with an invented
+profile.
+
+**The obvious diagnosis is wrong, and was tested.** The prompt says the agent has persistent memory and must
+never ask the traveller to repeat themselves, but never says what to do when the block is *absent* — so the
+natural fix is to add *"if no Traveller Context block is present, treat the traveller as new and invent
+nothing."* On three fresh actors, **all three still produced a fabricated block**, and one still hit the token
+limit. Stating the empty case changed nothing.
+
+**The real cause is format echo.** The prompt *names* the block and describes its fields. The model is not
+confused about whether it has memories; it is **reproducing the structure it was told exists**, filling the
+fields from whatever is to hand. On turn 1 the message contained *"I'm Alice"*, so the echoed `Name:` field got a
+real name. On turn 2 the message was *"I also prefer window seats and vegetarian meals"* — no name in it — but the
+template has a `Name:` field, the prompt forbids asking, and so the slot was filled with the generic placeholder
+a model reaches for when forced to invent one. "Alex Chen" exists in no stored record; it was verified absent
+from every actor's namespace, and reproduced on a brand-new actor whose namespaces were confirmed empty.
+**Fabrication is a function of the template having fields the input does not fill.**
+
+**The fix that works removes the template.** Describe the stored notes behaviourally — *"some messages begin with
+stored notes about the traveller... use them to personalise... do **not** repeat them back, do **not** produce a
+profile or summary section, never present a heading... if there are no stored notes, you know nothing about
+this traveller yet"* — and never give the block a name the model can echo. Three for three: *"Welcome, Alice!
+It's wonderful to **meet** you"*, 135–229 output tokens instead of 900 or a crash, no invented name. Set
+`max_tokens` explicitly as well; `BedrockModel` leaves it unset by default, which is how a runaway reply reached
+the hard limit instead of failing fast.
+
+> **Note:** this is lab 7's hallucination lesson from a different angle. There, the gap was a missing instruction
+> for when retrieval returns nothing. Here, adding that instruction did not help — because the model was not
+> filling a knowledge gap, it was completing a form. The general rule: **a prompt that names an output structure
+> will get that structure back**, whether or not the content exists to fill it. Describe the behaviour you want;
+> do not describe the shape of the input and expect the model not to reproduce it.
+
 ## What the demo proves, and the delay in the middle
 
 Session 1: Alice introduces herself — luxury travel, Asia, a $5,000 budget — across two invocations. Each turn's `(USER, ASSISTANT)` pair becomes an event; the extraction job turns them into records in `wanderbot/alice-001/facts` and `.../preferences`. Then `agentcore stop-session`, so the next call gets a **new `sessionId`**. Session 2: a recommendation request from the same `actor_id`, and the answer already knows the budget and the region. *"What do you remember about me?"* is the closing proof — nothing in session 2's events could have answered it.
@@ -2121,3 +2160,24 @@ The thing to notice is the pause between the sessions. Extraction is asynchronou
 - **The namespace template is the scope.** `wanderbot/{actorId}/facts` is per-user because `{actorId}` is in it; `get_memory_strategies` lets code read the templates instead of hard-coding them.
 - **Read per message, into the user message; write once, after the turn.** `MessageAddedEvent` with a role-and-toolResult guard for retrieval; `AfterInvocationEvent` for one `(USER, ASSISTANT)` event.
 - **Same hook pattern as lab 4, same `agent.state` plumbing**, two different events and a different injection point — chosen because the retrieved context is specific to the question being asked.
+- **A prompt that names an output block will get that block back, filled from whatever is to hand.** `demo.py`'s prompt names "Traveller Context" and the model echoes it on every cold turn, inventing a name when the message has none. Stating the empty case does not fix it; describing the behaviour without naming the block does. Set `max_tokens` so a runaway reply fails fast.
+
+## A trap that belongs to every notebook: boto3 caches credentials per session
+
+Refresh the lab's temporary credentials in `~/.aws-personal/credentials` while a kernel is running, re-run a cell,
+and it still fails with `ExpiredToken`. The file is correct — a fresh process authenticates immediately. The kernel
+is what is stale.
+
+**boto3 resolves credentials once per `Session` and holds them for that session's lifetime.** Every client built
+so far — Step 1's STS client, `MemoryClient`, `BedrockModel` — resolved from the file when it was first
+constructed and is still presenting that token. Editing the file changes the disk; nothing re-reads it. This is the
+same caching behaviour that made the credential *path* an environment-level decision in the lab 5 notes, now
+biting on the credential *value*.
+
+**Restart the kernel, then run from the top.** Re-running only the setup cell is not enough: it rebuilds one
+client, and the others keep the dead token until they too are rebuilt — so a later cell fails with the same error
+and looks like a different problem. Only a restart clears every session at once.
+
+The diagnostic that separates the two cases: `NoCredentialsError` means nothing was found (the environment);
+`ExpiredToken` or `InvalidClientTokenId` means something was found and rejected (the value, or a cached copy
+of it). Both appear at the first AWS call, and both have a one-step fix once you know which you are looking at.
