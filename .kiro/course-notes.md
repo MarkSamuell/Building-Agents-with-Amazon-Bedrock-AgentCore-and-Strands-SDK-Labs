@@ -2333,6 +2333,38 @@ So the two mechanisms are independent. In `demo.py` they coincide: `code_session
 
 The sandbox's isolation claims, checked rather than repeated: `urllib.request.urlopen("https://example.com")` fails with `URLError` — **no internet**. A session opens in about 1.4 s and a trivial script executes in about 1.2 s round trip, so the per-call cost of the fresh-sandbox design is roughly three seconds.
 
+## The exercise's `clearContext` demonstration — read it carefully
+
+The exercise builds the same tool for hotel costs, then tries to show what `clearContext` does: with it `True`, ask the agent to *"remember the budget = 2000"*, then in a second request ask it to *"print the stored total"* — and it cannot. Then the instructor flips the flag to `False`, redeploys, and moves on to a multi-step calculation.
+
+The first half is correct, but **not for the reason the demonstration implies**, and the implication is worth unpicking because it is the same confusion the previous section flagged. In `demo.py` each tool call runs `with code_session(REGION)`, which calls `start_code_interpreter_session` on enter and `stop()` on exit. **Two requests are two sandboxes.** A variable set in the first does not exist in the second whatever `clearContext` says — the interpreter it lived in has been destroyed. So flipping the flag to `False` and redeploying changes nothing about cross-request memory in this tool's shape; the "print the stored total" request would fail identically either way. The flag only matters when several `executeCode` calls share one session, which `demo.py` never does.
+
+What the demonstration *does* show, correctly, is the design property: **the agent cannot carry a number from one request to the next through the sandbox.** If a later calculation needs an earlier one's result, it has to arrive the way everything else arrives — in the conversation, via short-term memory — and be written into the next script by the model. The sandbox is compute, not storage.
+
+> **Note:** the within-session half of this — `clearContext=True` wiping a variable set by a previous `executeCode` in the *same* session — was measured directly in the previous section. The cross-session half follows from `code_session`'s source rather than from a run; the lab credentials expired before it could be executed. The conclusion does not depend on the run.
+
+## Multi-step arithmetic, and the standard library
+
+Two more things the exercise shows that the demo did not.
+
+**The model composes steps correctly when it writes them as code.** A prompt asking for a hotel subtotal, VAT on top, a loyalty discount, and conversion from USD to EUR produced a script that did exactly that, in order — base total, then VAT, then discount, then conversion, then `print`. That ordering is the thing a model gets wrong when asked for the *number*; asked for the *program*, the dependency between steps is explicit in the code and the arithmetic is the interpreter's problem. The logged script is the audit trail: you can read which rate it applied at which step.
+
+**The sandbox is a full Python environment, standard library included.** Asked how many nights fall between two dates, the model `import`ed `datetime`, built two `date` objects and subtracted them — no estimation, no counting on fingers. Anything in the standard library is available; `install_packages()` exists on the client for anything that is not, at the cost of doing it per session.
+
+## The default interpreter, and when to make your own
+
+`code_session(REGION)` with no `identifier` uses `aws.codeinterpreter.v1`, the interpreter AWS ships — the same resource-id pattern as the default browser. Its network mode is **sandbox**: no internet, restricted permissions, encrypted. That is the right default, and it is why the `urlopen` test above fails.
+
+When the code *needs* to reach somewhere, create a custom interpreter and pass its id as `identifier=`. The one required decision is the network mode:
+
+| `networkMode` | What the code can reach | When |
+| --- | --- | --- |
+| **`SANDBOX`** | nothing outside the sandbox | arithmetic, data shaping, anything self-contained — the default |
+| **`PUBLIC`** | the internet | the script must fetch a live exchange rate or call a public API |
+| **`VPC`** | resources inside your VPC, via `vpcConfig` | the script must read a private database or an internal service |
+
+Each is a different *attack surface*, not just a different capability. A `PUBLIC` interpreter running LLM-written code can be prompt-injected into exfiltrating whatever the script can see; a `VPC` one can be pointed at internal systems. The isolation argument that opened this topic is strongest in `SANDBOX` mode and weakens with each step outward — so the custom interpreter is the place to be deliberate, not a convenience toggle.
+
 ## Where to watch it
 
 Two places show the generated code and its execution. The tool's own `print("Generated Code: ...")` lands in the agent's logs — CloudWatch for a deployed agent, stdout locally — and is the thing to read when a total is wrong, because it shows *exactly* the script the model wrote: the variables it defined from the user's message, the arithmetic, and the breakdown it chose to print. In the console, **AgentCore → Code Interpreter** lists the default interpreter (`aws.codeinterpreter.v1`, the same resource-id pattern as the default browser) and every recent session run against it, which is where to confirm an invocation reached the sandbox at all.
@@ -2340,8 +2372,13 @@ Two places show the generated code and its execution. The tool's own `print("Gen
 ## Key takeaways
 
 - **Models are unreliable calculators and reliable programmers.** Ask for a script, not a number, and run the script.
-- **The hard problem is where LLM-written code runs.** Code Interpreter is a managed sandbox: no host access, no internet (verified), no carried state — the agent process never executes anything.
-- **One `@tool`**: `code_session(REGION)` opens and closes a sandbox around a single `invoke("executeCode", ...)`.
-- **`print()` is the return channel.** The result carries `stdout`, `stderr`, `exitCode` and `executionTime`, so a crash comes back as a traceback the model can act on.
-- **`clearContext` resets interpreter state inside a session; `code_session` creates the session.** They coincide in the demo. Reuse a session and `clearContext` is doing all the isolation.
+- **The hard problem is where LLM-written code runs.** `invoke("executeCode", {...})` runs the script the LLM wrote, and the sandbox is the right place for that code; your application process is not. Code Interpreter is a managed sandbox: no host access, no internet (verified), no carried state.
+- **`code_session(REGION)` is a context manager that opens an ephemeral sandbox on enter and closes it on exit.** One `@tool` wraps one session around one `invoke`.
+- **Results arrive via `response["stream"]`.** Iterate and return `json.dumps(event["result"])`; a single `executeCode` yields one event. `print()` is the return channel — the result carries `stdout`, `stderr`, `exitCode` and `executionTime`, so a crash comes back as a traceback the model can act on.
+- **`clearContext=True` prevents state leaking between `executeCode` calls that share a session.** In the demo each call also gets its own session, so isolation is doubled; reuse a session for speed and `clearContext` is doing all of it. Across separate sessions the flag is irrelevant — the interpreter is gone.
+- **The sandbox is compute, not storage.** Nothing carries between requests; a result needed later must travel through the conversation.
+- **Inject data into the code string.** The sandbox has no network, so exchange rates, prices and any other inputs must be embedded in the script before execution — fetched by the agent, or already in the conversation.
+- **Reserve it for precision work** — multi-step arithmetic, tax and discount chains, currency conversion, data shaping. Opening a sandbox costs ~1.4 s and a round trip ~3 s, so skip it for trivial math the model can do in its head.
+- **Full standard library, composable steps.** `datetime` arithmetic and ordered multi-step cost logic work because the model writes the program and the interpreter runs it.
 - **Log the generated code.** It is the only view of what the model actually computed, and the first thing to read when a total is wrong.
+- **Custom interpreters choose a network mode — `SANDBOX`, `PUBLIC` or `VPC`** — and each one widens what prompt-injected code could reach. Default to `SANDBOX`.
