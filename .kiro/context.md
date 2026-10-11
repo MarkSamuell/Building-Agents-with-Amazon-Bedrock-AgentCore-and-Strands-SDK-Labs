@@ -21,6 +21,7 @@ turn; the course knowledge lives in `course-notes.md` and is read on demand.
 | Python env | `.venv/` at the repo root, created with `uv`. Deps pinned in `lab_1/requirements.txt` |
 | Course notes | `~/Documents/Study-Notes/AI/AWS AI Agentic Engineer Nanodegree/1- Building Agents with Amazon Bedrock AgentCore and Strands SDK.md` |
 | Growing course knowledge | `.kiro/course-notes.md` in this directory |
+| Interview recap | `.kiro/course-recap.md` -- one block per lesson (one idea / mechanism / keywords / traps), derived from the notes and the lab files; append a block when a new lesson's notes are done |
 
 The notes path is **outside the path scope of a session started here**, so a labs
 session must not read it. Work on the notes belongs in a session started from
