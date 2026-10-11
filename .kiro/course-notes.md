@@ -2233,3 +2233,115 @@ thing to attach to a bug report).
 > supported... use the AgentCore CLI (@aws/agentcore)."* Set `AGENTCORE_SUPPRESS_RECOMMENDATION=1` to silence
 > it. The Node CLI needs Node 20+, which this machine does not have, so the Python toolkit remains the working
 > route here; the `browse` TUI is one of the things that may not survive the migration.
+
+# From Fuzzy Arithmetic to Exact Totals
+
+Ask a model for two passengers at $450, four nights at $120, plus insurance, and it will often get a digit wrong — and present the wrong digit with total confidence. Trip costs, taxes, loyalty discounts and currency conversions are exactly the answers a travel company cannot afford to have *generated*. They have to be *computed*.
+
+The fix is to stop asking the model to do arithmetic and instead have it **write a short program that does the arithmetic**, then run that program. A model is a far better programmer than calculator: it will reliably produce `total = flights + hotel + insurance` and get the expression right, where it would not reliably produce the number.
+
+## The second problem is the real one: where does LLM-written code run?
+
+Once the model writes a script, something has to execute it, and that is the dangerous part. Running it inside your own agent process is **arbitrary code execution on untrusted input** — the input being whatever the user typed, laundered through the model into Python:
+
+| Risk | What goes wrong |
+| --- | --- |
+| **State leakage** | one customer's variables are still in memory when the next customer's script runs |
+| **Dependency conflicts** | the script `import`s something that fights your agent's own packages |
+| **Prompt injection → filesystem** | a user crafts a message that makes the model write code that reads your config, your credentials, your other customers' data |
+| **Resource abuse** | an infinite loop or a memory bomb takes the agent down |
+
+**AgentCore Code Interpreter** is the answer to the second problem, and the first comes along for free. It is a managed sandbox — Python, JavaScript or TypeScript — with **no host access, no internet, and no state carried from a previous call**. The agent hands it code; it hands back what the code printed.
+
+## The whole integration is one `@tool`
+
+``` Python
+# pip install strands-agents bedrock-agentcore
+# =====================================================
+# A CODE-EXECUTION TOOL - the complete integration
+# =====================================================
+import json
+from bedrock_agentcore.tools.code_interpreter_client import code_session
+from strands import tool
+
+REGION = "us-east-1"
+
+
+@tool
+def execute_python(code: str, description: str = "") -> str:
+    """Execute Python code in an isolated AgentCore sandbox and return the output."""
+    if description:
+        code = f"# {description}\n{code}"      # the model's own one-line summary, as a comment
+
+    # 1. Surface what the model wrote. This is the only place you ever see the
+    #    generated script; without it, debugging a wrong total is guesswork.
+    print(f"\nGenerated Code:\n{code}\n")
+
+    # 2. code_session opens a sandbox on enter and closes it on exit. Each call
+    #    to this tool is therefore its own sandbox, start to finish.
+    with code_session(REGION) as code_client:
+        response = code_client.invoke("executeCode", {
+            "code": code,
+            "language": "python",
+            "clearContext": True,              # fresh interpreter state for this execution
+        })
+
+    # 3. The response streams events; a single executeCode yields one. Its
+    #    "result" is what the model reads back.
+    for event in response["stream"]:
+        return json.dumps(event["result"])
+```
+
+Lab 2's `@tool` pattern with a sandbox call inside it. The model never runs code; it writes a string, and the tool is the only thing that executes anything — *outside* the agent's process, in AWS.
+
+**The division of labour matters.** The model is asked for a *program*, not an *answer*: the system prompt says *"write a short Python script that computes the answer and calls `print()` on the final result. Never estimate or guess numbers yourself."* The `print()` instruction is load-bearing — the sandbox returns stdout, so a script that computes a total and does not print it returns nothing the model can use.
+
+## What actually comes back
+
+The course says the tool "returns the first result as JSON so the agent can read `print()` output." The real result, observed from a live sandbox, is richer than that and worth knowing:
+
+```json
+{
+  "content": [ {"type": "text", "text": "flights 900\ndone"}, {"type": "text", "text": "a warning"} ],
+  "structuredContent": {
+    "stdout": "flights 900\ndone",
+    "stderr": "a warning",
+    "exitCode": 0,
+    "executionTime": 0.073
+  },
+  "isError": false
+}
+```
+
+So the model does not get bare stdout — it gets **stdout and stderr as separate fields, an exit code, and a timing**. That is what lets it tell a clean result from a crash: a script that raises returns `exitCode: 1` and a full Python traceback in `stderr`, with `stdout` empty. The model reads the traceback and can rewrite the script — which is lab 2's self-correcting tool-error loop, now with a sandbox doing the erroring.
+
+> **Note:** a bare expression on the last line of a script shows up in `stdout` too — `print('a')` followed by `10` yields `"a\n\n10"`. The sandbox is a Jupyter-style kernel, and it echoes the final expression's value the way a notebook cell does. Harmless, but it explains a stray number in the output that no `print()` produced.
+
+## `clearContext` — what it clears, and what the course gets wrong
+
+The lesson says `clearContext=True` means "every single call starts with a brand new Python environment." That is the effect in *this* tool, but not for the reason given, and the distinction matters as soon as you change the tool's shape.
+
+A **session** is the sandbox — a running interpreter with a lifetime (15 minutes by default, `session_timeout_seconds`). `clearContext` does not create a session; it **resets the interpreter state inside one**. Measured, within a single session:
+
+```
+set x = 5    clearContext=False  ->  ok
+print(x)     clearContext=False  ->  5           state persisted
+print(x)     clearContext=True   ->  NameError   state cleared
+```
+
+So the two mechanisms are independent. In `demo.py` they coincide: `code_session` opens a fresh sandbox *and* `clearContext=True` wipes the interpreter, so there is nothing to leak twice over — and the sandbox is torn down 1.5 seconds later anyway. But move the `with code_session(...)` to module scope to save the ~1.4 s startup per call, and **`clearContext` becomes the only thing standing between one customer's variables and the next's**. The course's one-liner is true of the demo and false of the obvious optimisation of it.
+
+The sandbox's isolation claims, checked rather than repeated: `urllib.request.urlopen("https://example.com")` fails with `URLError` — **no internet**. A session opens in about 1.4 s and a trivial script executes in about 1.2 s round trip, so the per-call cost of the fresh-sandbox design is roughly three seconds.
+
+## Where to watch it
+
+Two places show the generated code and its execution. The tool's own `print("Generated Code: ...")` lands in the agent's logs — CloudWatch for a deployed agent, stdout locally — and is the thing to read when a total is wrong, because it shows *exactly* the script the model wrote: the variables it defined from the user's message, the arithmetic, and the breakdown it chose to print. In the console, **AgentCore → Code Interpreter** lists the default interpreter (`aws.codeinterpreter.v1`, the same resource-id pattern as the default browser) and every recent session run against it, which is where to confirm an invocation reached the sandbox at all.
+
+## Key takeaways
+
+- **Models are unreliable calculators and reliable programmers.** Ask for a script, not a number, and run the script.
+- **The hard problem is where LLM-written code runs.** Code Interpreter is a managed sandbox: no host access, no internet (verified), no carried state — the agent process never executes anything.
+- **One `@tool`**: `code_session(REGION)` opens and closes a sandbox around a single `invoke("executeCode", ...)`.
+- **`print()` is the return channel.** The result carries `stdout`, `stderr`, `exitCode` and `executionTime`, so a crash comes back as a traceback the model can act on.
+- **`clearContext` resets interpreter state inside a session; `code_session` creates the session.** They coincide in the demo. Reuse a session and `clearContext` is doing all the isolation.
+- **Log the generated code.** It is the only view of what the model actually computed, and the first thing to read when a total is wrong.
