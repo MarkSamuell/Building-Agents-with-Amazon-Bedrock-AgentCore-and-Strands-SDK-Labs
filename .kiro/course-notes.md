@@ -2382,3 +2382,85 @@ Two places show the generated code and its execution. The tool's own `print("Gen
 - **Full standard library, composable steps.** `datetime` arithmetic and ordered multi-step cost logic work because the model writes the program and the interpreter runs it.
 - **Log the generated code.** It is the only view of what the model actually computed, and the first thing to read when a total is wrong.
 - **Custom interpreters choose a network mode — `SANDBOX`, `PUBLIC` or `VPC`** — and each one widens what prompt-injected code could reach. Default to `SANDBOX`.
+
+# Every Invocation as a Trace
+
+WanderBot is feature-complete. Before it goes live, someone has to be able to answer four questions about any given request: which tools did it call, how long did each take, how many tokens did it burn, and did anything error? Agents fail in strange ways — a tool times out, the model picks the wrong tool, token cost drifts up silently, a customer gets an odd answer nobody can reproduce — and without a record of what actually happened, debugging all of that is guesswork.
+
+The course's pitch: on AgentCore Runtime this is **essentially free**. One dependency, `aws-opentelemetry-distro`, and every invocation becomes a trace in the CloudWatch GenAI Observability Dashboard. That is true, and the lab's `demo.py` proves it by containing **no observability code at all** — two `@tool`s, a prompt, an entrypoint. The interesting question is *why* it is true, because the answer is not quite "the distro does it".
+
+## Three vocabulary words, in containment order
+
+| Term | What it is | In WanderBot's terms |
+| --- | --- | --- |
+| **Session** | one live Runtime session — the container's conversation | everything between `agentcore invoke` calls until `agentcore stop-session` |
+| **Trace** | one agent invocation, end to end | one turn: one `agentcore invoke` |
+| **Span** | one unit of work inside a trace | the agent invocation itself, each model call, each tool call |
+
+```
+Session
+ └── Trace  (one invoke)
+      └── invoke_agent WanderBot                   root span: model, tokens, latency
+           └── execute_event_loop_cycle
+                ├── chat                            a model call: tokens in/out, time to first token
+                ├── execute_tool search_flights     inputs, output, duration
+                ├── chat                            the model reading the tool result
+                └── ...
+```
+
+A trace is a **tree**, and the tree *is* the agent loop from the very first module made visible: model call → tool → model call, as spans with timings. The demo's "ten spans for one turn" is that loop with a tool in it, plus the memory and event-loop spans around it.
+
+## Who actually emits the spans — the correction to the course
+
+The lesson credits the distro with "automatically capturing all the metrics." Reading the installed source, the work is split three ways, and knowing the split is what tells you what to do when traces are missing.
+
+**Strands emits the spans.** `strands/telemetry/tracer.py` creates every span in the tree above — `invoke_agent {name}`, `chat`, `execute_tool {name}`, `execute_event_loop_cycle`, and `memory.*` for the memory hooks — and sets their attributes using the **OpenTelemetry GenAI semantic conventions**: `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, `gen_ai.tool.name`, `gen_ai.tool.call.arguments` / `result`, `gen_ai.server.time_to_first_token`, and so on. This happens in *every* agent you have run, including the ones in this repo's notebooks; the spans were always being created.
+
+**The distro exports them.** `aws-opentelemetry-distro` (ADOT) is the thing that catches those spans and ships them to CloudWatch and X-Ray. Without it, Strands is talking into the void — the spans exist in-process and go nowhere. That is the precise sense in which "one dependency" is the whole change: it adds the *exporter*, not the *instrumentation*.
+
+**The container launch turns it on.** The toolkit's `Dockerfile.j2` template does two things when observability is enabled, and the second is the one easy to miss:
+
+```dockerfile
+RUN uv pip install aws-opentelemetry-distro==0.12.2
+...
+CMD ["opentelemetry-instrument", "python", "-m", "{{ agent_module_path }}"]
+```
+
+The agent is not started with `python`; it is started with **`opentelemetry-instrument python`**, ADOT's wrapper, which configures the exporter and auto-instruments boto3 and HTTP before your code runs. Runtime supplies the destination through environment variables — the SDK reads `OTEL_RESOURCE_ATTRIBUTES` to learn its own runtime ARN. So the three pieces are: Strands instruments, the distro exports, the wrapper wires them together at launch.
+
+> **Note:** the distro is **not** in this repo's `.venv` — `opentelemetry-sdk` is (Strands depends on it to create spans), but `aws-opentelemetry-distro` is not. The notebooks therefore produced spans that were never exported anywhere. That is the expected state for local work, and it is also the demonstration of the split above: instrumentation present, exporter absent, dashboard empty.
+
+## "Already instrumented from day one" — true, with a footnote
+
+The lesson says every agent shipped in this course was in the dashboard already. For the toolkit-built agents, yes: the Dockerfile template installs the pinned distro and uses the wrapper **whenever `observability_enabled` is set**, which it is by default. So adding the distro to `requirements.txt` is redundant on that path — harmless, but the template already did it.
+
+Two footnotes, both from this repo's history. First, **build your own image and the whole step is yours**: the pinned install *and* the `opentelemetry-instrument` wrapper in `CMD`. Forget the wrapper and the distro is installed but never activated. Second, in the lab account the dashboard was **partly blocked**: `application-signals:StartDiscovery` was denied for the `voclabs` role, so Transaction Search was skipped and X-Ray trace delivery failed validation — while CloudWatch *logs* worked fine. "Free" assumes the account permits the destination; in a locked-down account, the exporter can be perfectly configured and still have nowhere to deliver.
+
+## Reading a trace
+
+Open **CloudWatch → GenAI Observability → Bedrock AgentCore**. The top level shows every AgentCore capability — Agents, Gateway, Identity, Memory, Built-in Tools — each with sessions, traces and tokens. Headline metrics are on by default; **traces are opt-in per resource**, which is the other reason a resource can show counts but no span trees.
+
+Under *Agents*, pick a session, then a trace. What each span tells you, and which failure it catches:
+
+| Span | Carries | The failure it exposes |
+| --- | --- | --- |
+| **root** `invoke_agent` | total latency, model id, total tokens in/out | token cost drifting upward; a slow turn |
+| **`chat`** | per-call tokens, time to first token, the messages in and out | a model call that stalled; what the model was actually shown |
+| **`execute_tool`** | tool name, arguments, result, duration, status | the wrong tool chosen; a tool that timed out; bad arguments |
+
+The *arguments and result* on a tool span are the thing lab 5's CloudWatch tail gave you by hand — the model's choice, as the tool received it. Here it is for every tool, every turn, without writing a log line. The demo's third request — flights from New York to Rome, where there are none — is the useful case: the trace shows a valid `execute_tool` span with an empty result, so "no answer" is distinguishable from "the tool failed".
+
+**Session grouping is Runtime's session, not yours.** Consecutive `agentcore invoke` calls share a Runtime session and appear together; `agentcore stop-session` ends it and the next call starts a new one. That is the same `context.session_id` lab 4 fed into memory — so a trace session and a memory session are the same boundary, seen from two dashboards.
+
+> **Note:** the `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions` and tool argument/result attributes carry **customer text** — the whole conversation, the system prompt, whatever a tool returned. Strands has a redaction policy for exactly these keys. Before this goes live for Horizon's real travellers, decide what the trace is allowed to contain; a span tree is also a log of everything the customer said.
+
+## Key takeaways
+
+- **Observability on AgentCore Runtime is free.** One dependency — `aws-opentelemetry-distro` — and every invocation lands in CloudWatch as a trace; `demo.py` contains no observability code.
+- **Strands instruments; the distro exports; `opentelemetry-instrument` wires them at launch.** Spans are created in every Strands agent regardless. The distro is the exporter, and the wrapper in `CMD` is what activates it.
+- **The toolkit's Dockerfile does both for you** when observability is enabled (the default), with the distro pinned. Build your own image and both steps are yours — install *and* wrapper.
+- **Session ⊃ trace ⊃ span.** A session is a Runtime session; a trace is one invoke; a span is one unit of work. The span tree is the agent loop drawn out.
+- **Tool spans carry arguments, result and duration** — the wrong-tool and timed-out-tool failures are read straight off them. The root span carries model and token counts.
+- **Consecutive invokes share a session; `stop-session` breaks it.** Same boundary as memory's `session_id`.
+- **Traces are opt-in per resource; headline metrics are not.** And the destination must be permitted — a locked-down account can block delivery with the exporter perfectly configured.
+- **A trace is a transcript.** Message and tool attributes hold customer text; apply the redaction policy before production.
