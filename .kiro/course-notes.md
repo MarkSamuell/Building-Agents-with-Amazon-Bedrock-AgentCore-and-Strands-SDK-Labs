@@ -2452,7 +2452,46 @@ The *arguments and result* on a tool span are the thing lab 5's CloudWatch tail 
 
 **Session grouping is Runtime's session, not yours.** Consecutive `agentcore invoke` calls share a Runtime session and appear together; `agentcore stop-session` ends it and the next call starts a new one. That is the same `context.session_id` lab 4 fed into memory — so a trace session and a memory session are the same boundary, seen from two dashboards.
 
+## The other tabs: one per AgentCore service
+
+The dashboard is not an agent dashboard with extras; it has a tab for every AgentCore capability — **Agents**,
+**Gateway**, **Identity**, **Memory**, and **Built-in Tools** (Browser and Code Interpreter together). Every tab
+shows **utilisation metrics out of the box**: sessions, invocations, compute, memory. Those are the headline
+numbers and they are always on.
+
+**Traces are a separate switch, per resource.** Enable tracing on a Gateway, a memory resource or an interpreter
+and that tab's trace view fills with span trees; leave it off and the tab shows counts and nothing underneath
+them. Agent Runtime tracing is on by default — which is why every lesson's agents appeared without anyone asking
+— but the other four are opt-in. In this course **memory tracing is enabled**, so the Memory tab shows traces for
+`create_event` calls and retrievals alongside the agent traces.
+
+Where those memory traces come from is worth a sentence, because it is not where you might guess. Strands does
+emit `memory.*` spans — `memory.add`, `memory.search`, `memory.inject`, `memory.extract`, with attributes like
+`memory.query`, `memory.result.count` and `memory.store.name` — but those belong to its own `MemoryManager`
+plugin, not to the `MemoryClient.create_event` and `retrieve_memories` calls that lab 8's hook made directly.
+A hook calling boto3 produces no Strands span. The Memory tab's `create_event` traces are therefore the
+**service's own** instrumentation of the memory resource, switched on by that resource's tracing setting —
+which is precisely what "opt-in per resource" means. Same for Gateway: a tool call through a Gateway appears as
+an `execute_tool` span in the *agent's* trace regardless, but the Gateway *tab* only shows the Gateway-side span
+tree if tracing is enabled on the Gateway itself.
+
+So a resource with headline metrics but an empty trace view is not broken. It is a resource whose tracing was
+never switched on — the single most likely reason a tab looks half-populated.
+
 > **Note:** the `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions` and tool argument/result attributes carry **customer text** — the whole conversation, the system prompt, whatever a tool returned. Strands has a redaction policy for exactly these keys. Before this goes live for Horizon's real travellers, decide what the trace is allowed to contain; a span tree is also a log of everything the customer said.
+
+## Common mistakes, and the mechanism behind each
+
+| Mistake | Why it fails | The mechanism |
+| --- | --- | --- |
+| **Running `app.run()` locally and expecting traces** | nothing appears in the dashboard | the dashboard shows invocations routed through **AgentCore Runtime**. Locally there is no `opentelemetry-instrument` wrapper, no `OTEL_RESOURCE_ATTRIBUTES`, no exporter destination — Strands still *creates* spans, and they go nowhere. Deploy first, then invoke |
+| **Assuming each invoke is a new session** | scenarios blur together in one session | consecutive `agentcore invoke` calls share the Runtime session automatically. `agentcore stop-session` between scenarios is what separates them — the same boundary memory's `session_id` uses |
+| **Dropping the distro from a custom Dockerfile** | spans created, never exported | the toolkit's template pins `aws-opentelemetry-distro` *and* launches via `opentelemetry-instrument`. Build your own image and both are yours — and the wrapper is the one people forget, because the install alone looks like it should be enough |
+| **Expecting traces on every service by default** | Gateway / Identity / Memory / tools tabs show counts, no trees | Agent Runtime tracing is on; the rest is **opt-in per resource**. Headline metrics never need the switch; span trees always do |
+
+The first row is the one this repo's notebooks sit on. Every notebook agent was instrumented — Strands made the
+spans — and none of them ever reached a dashboard, because none ran inside Runtime. That is the correct state for
+local work, not a defect: the instrumentation/export split from earlier in this topic, seen from the local side.
 
 ## Key takeaways
 
